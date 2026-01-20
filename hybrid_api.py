@@ -607,4 +607,7 @@ async def shutdown_event():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("hybrid_api:app", host="0.0.0.0", port=8000, reload=True, workers=1)
+    # Disable reload for production to avoid double initialization
+    # Set reload=True only for development
+    reload_enabled = os.environ.get('UVICORN_RELOAD', 'False').lower() == 'true'
+    uvicorn.run("hybrid_api:app", host="0.0.0.0", port=8000, reload=reload_enabled, workers=1)

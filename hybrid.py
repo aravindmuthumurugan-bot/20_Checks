@@ -8,13 +8,14 @@ from typing import Dict, List, Tuple, Optional
 from retinaface import RetinaFace
 from nudenet import NudeDetector
 
-# InsightFace imports (BACKBONE)
-import insightface
-from insightface.app import FaceAnalysis
-from insightface.model_zoo import get_model
+# InsightFace imports (BACKBONE) - moved inside functions for lazy loading
 
-# DeepFace imports (AGE & ETHNICITY ONLY)
-from deepface import DeepFace
+# Environment variables to speed up startup
+os.environ['DISABLE_MODEL_SOURCE_CHECK'] = 'True'  # Disable DeepFace connectivity check
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduce TensorFlow logging (0=all, 1=info, 2=warning, 3=error)
+os.environ['ORT_LOG_LEVEL'] = '3'  # Reduce ONNX Runtime logging (0=verbose, 1=info, 2=warning, 3=error, 4=fatal)
+
+# DeepFace imports (AGE & ETHNICITY ONLY) - moved inside functions for lazy loading
 
 # OCR for GPU-accelerated text detection (PII Check)
 # Try PaddleOCR first (better GPU support, no lzma dependency), fallback to EasyOCR
@@ -217,6 +218,8 @@ if OCR_AVAILABLE:
 else:
     print("No OCR engine available. Install with: pip install paddlepaddle-gpu paddleocr")
 
+print("InsightFace: Lazy initialization on first use")
+
 
 # ==================== STAGE 1 CONFIGURATION ====================
 
@@ -272,29 +275,43 @@ PRIMARY_PERSON_MATCH_THRESHOLD = 0.50
 
 # ==================== INSIGHTFACE INITIALIZATION (BACKBONE) ====================
 
-print("Initializing InsightFace (BACKBONE) with GPU acceleration...")
-if ONNX_GPU_AVAILABLE:
-    app = FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-    print("InsightFace: Using CUDA GPU")
-else:
-    app = FaceAnalysis(providers=['CPUExecutionProvider'])
-    print("InsightFace: Using CPU")
+# Lazy initialization for InsightFace to speed up startup
+app = None
+recognition_model = None
+insightface_initialized = False
+_insightface_lock = threading.Lock()
 
-app.prepare(ctx_id=0 if ONNX_GPU_AVAILABLE else -1, det_size=(640, 640))
+def get_insightface_app():
+    """
+    Thread-safe lazy initialization of InsightFace app.
+    """
+    global app, insightface_initialized
 
-# Initialize recognition model for face comparison
-print("Loading InsightFace recognition model...")
-try:
-    if ONNX_GPU_AVAILABLE:
-        recognition_model = get_model('buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-    else:
-        recognition_model = get_model('buffalo_l', providers=['CPUExecutionProvider'])
-    print("InsightFace recognition model loaded successfully")
-except Exception as e:
-    print(f"Note: Recognition model loading info: {e}")
-    recognition_model = None
+    if insightface_initialized:
+        return app
 
-print(f"InsightFace initialized successfully (BACKBONE) - GPU: {ONNX_GPU_AVAILABLE}")
+    with _insightface_lock:
+        if insightface_initialized:
+            return app
+
+        # Lazy import to delay model loading until first use
+        import insightface
+        from insightface.app import FaceAnalysis
+
+        print("Initializing InsightFace (BACKBONE) with GPU acceleration...")
+        if ONNX_GPU_AVAILABLE:
+            app = FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+            print("InsightFace: Using CUDA GPU")
+        else:
+            app = FaceAnalysis(providers=['CPUExecutionProvider'])
+            print("InsightFace: Using CPU")
+
+        app.prepare(ctx_id=0 if ONNX_GPU_AVAILABLE else -1, det_size=(640, 640))
+        insightface_initialized = True
+        print(f"InsightFace initialized successfully (BACKBONE) - GPU: {ONNX_GPU_AVAILABLE}")
+        return app
+
+# Note: recognition_model removed as it's not used in the code
 
 
 # ==================== DEEPFACE CONFIGURATION (AGE & ETHNICITY ONLY) ====================
@@ -659,7 +676,7 @@ def find_primary_person_in_group(
         group_img = cv2.imread(group_photo_path)
         ref_img = cv2.imread(reference_photo_path)
         
-        group_faces = app.get(group_img)
+        group_faces = get_insightface_app().get(group_img)
         
         if not group_faces or len(group_faces) == 0:
             return False, None, None, "No faces detected in group photo"
@@ -667,7 +684,7 @@ def find_primary_person_in_group(
         if len(group_faces) == 1:
             return False, None, None, "Only one face detected - not a group photo"
         
-        ref_faces = app.get(ref_img)
+        ref_faces = get_insightface_app().get(ref_img)
         if not ref_faces or len(ref_faces) == 0:
             return False, None, None, "No face detected in reference photo"
         
@@ -834,12 +851,12 @@ def stage1_validate(
             # Use InsightFace to verify the person matches
             try:
                 ref_img = cv2.imread(reference_photo_path)
-                ref_faces = app.get(ref_img)
+                ref_faces = get_insightface_app().get(ref_img)
                 if not ref_faces or len(ref_faces) == 0:
                     return reject("No face detected in reference photo", checks)
 
                 curr_img = cv2.imread(image_path)
-                curr_faces = app.get(curr_img)
+                curr_faces = get_insightface_app().get(curr_img)
                 if not curr_faces or len(curr_faces) == 0:
                     return reject("No face detected in secondary photo", checks)
 
@@ -1055,7 +1072,7 @@ def analyze_face_insightface(img_path: str) -> Dict:
         if img is None:
             return {"error": "Could not read image", "data": None}
         
-        faces = app.get(img)
+        faces = get_insightface_app().get(img)
         
         if not faces or len(faces) == 0:
             return {"error": "No face detected", "data": None}
@@ -1084,6 +1101,9 @@ def validate_age_deepface(img_path: str, profile_age: int) -> Dict:
     Age verification using DeepFace with GPU acceleration (PRIMARY photos only)
     DeepFace has better age accuracy than InsightFace
     """
+    # Lazy import to delay model loading
+    from deepface import DeepFace
+
     try:
         print(f"[DeepFace GPU] Running age detection for profile age: {profile_age}...")
         
@@ -1181,6 +1201,9 @@ def validate_ethnicity_deepface(img_path: str) -> Dict:
     3. Disallowed ethnicities should not exceed their thresholds
        - DISALLOWED_ETHNICITIES are in decimal format (0.60 = 60%)
     """
+    # Lazy import to delay model loading
+    from deepface import DeepFace
+
     try:
         print("[DeepFace GPU] Running ethnicity detection...")
         
@@ -1270,6 +1293,9 @@ def validate_gender_deepface(img_path: str, profile_gender: str) -> Dict:
     """
     Gender validation using DeepFace with GPU acceleration (optional fallback if InsightFace gender is unreliable)
     """
+    # Lazy import to delay model loading
+    from deepface import DeepFace
+
     try:
         print("[DeepFace GPU] Running gender detection...")
         
@@ -2509,42 +2535,45 @@ def validate_photo_complete_hybrid(
 
 # ==================== USAGE EXAMPLE ====================
 
-if __name__ == "__main__":
-    
-    print("\n" + "="*70)
-    print("EXAMPLE: HYBRID PHOTO VALIDATION")
-    print("="*70)
-    
-    profile_data = {
-        "matri_id": "BM123456",
-        "gender": "Male",
-        "age": 28
-    }
-    
-    result = validate_photo_complete_hybrid(
-        image_path="test_image.jpg",
-        photo_type="PRIMARY",
-        profile_data=profile_data,
-        run_stage2=True,
-        use_deepface_gender=False  # Use InsightFace for gender (faster)
-    )
-    
-    print(f"\nFinal Decision: {result['final_decision']}")
-    print(f"Final Action: {result['final_action']}")
-    print(f"Reason: {result['final_reason']}")
-    
-    if result.get('checklist_summary'):
-        checklist = result['checklist_summary']
-        print(f"\n{'='*70}")
-        print("CHECKLIST SUMMARY")
-        print(f"{'='*70}")
-        print(f"Total: {checklist['total_checks']}, Passed: {checklist['passed']}, Failed: {checklist['failed']}")
-        print(f"Skipped: {checklist['skipped']}, Review: {checklist['review']}")
-    
-    if result.get('stage2'):
-        print(f"\n{'='*70}")
-        print("LIBRARY USAGE")
-        print(f"{'='*70}")
-        print(f"InsightFace: {', '.join(result['stage2']['library_usage']['insightface'])}")
-        if result['stage2']['library_usage']['deepface']:
-            print(f"DeepFace: {', '.join(result['stage2']['library_usage']['deepface'])}")
+# Commented out to prevent accidental execution during import
+# Uncomment only for testing standalone
+#
+# if __name__ == "__main__":
+#
+#     print("\n" + "="*70)
+#     print("EXAMPLE: HYBRID PHOTO VALIDATION")
+#     print("="*70)
+#
+#     profile_data = {
+#         "matri_id": "BM123456",
+#         "gender": "Male",
+#         "age": 28
+#     }
+#
+#     result = validate_photo_complete_hybrid(
+#         image_path="test_image.jpg",
+#         photo_type="PRIMARY",
+#         profile_data=profile_data,
+#         run_stage2=True,
+#         use_deepface_gender=False  # Use InsightFace for gender (faster)
+#     )
+#
+#     print(f"\nFinal Decision: {result['final_decision']}")
+#     print(f"Final Action: {result['final_action']}")
+#     print(f"Reason: {result['final_reason']}")
+#
+#     if result.get('checklist_summary'):
+#         checklist = result['checklist_summary']
+#         print(f"\n{'='*70}")
+#         print("CHECKLIST SUMMARY")
+#         print(f"{'='*70}")
+#         print(f"Total: {checklist['total_checks']}, Passed: {checklist['passed']}, Failed: {checklist['failed']}")
+#         print(f"Skipped: {checklist['skipped']}, Review: {checklist['review']}")
+#
+#     if result.get('stage2'):
+#         print(f"\n{'='*70}")
+#         print("LIBRARY USAGE")
+#         print(f"{'='*70}")
+#         print(f"InsightFace: {', '.join(result['stage2']['library_usage']['insightface'])}")
+#         if result['stage2']['library_usage']['deepface']:
+#             print(f"DeepFace: {', '.join(result['stage2']['library_usage']['deepface'])}")
