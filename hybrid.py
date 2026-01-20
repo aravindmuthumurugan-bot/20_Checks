@@ -16,14 +16,39 @@ from insightface.model_zoo import get_model
 # DeepFace imports (AGE & ETHNICITY ONLY)
 from deepface import DeepFace
 
-# EasyOCR for GPU-accelerated text detection (PII Check)
+# OCR for GPU-accelerated text detection (PII Check)
+# Try PaddleOCR first (better GPU support, no lzma dependency), fallback to EasyOCR
+OCR_ENGINE = None
+OCR_AVAILABLE = False
+paddleocr_instance = None
+easyocr_reader = None
+
+# Try PaddleOCR first (recommended for GPU)
 try:
-    import easyocr
-    EASYOCR_AVAILABLE = True
-    print("EasyOCR loaded successfully")
+    from paddleocr import PaddleOCR
+    OCR_ENGINE = "paddleocr"
+    OCR_AVAILABLE = True
+    print("PaddleOCR loaded successfully (GPU-accelerated)")
 except ImportError:
-    EASYOCR_AVAILABLE = False
-    print("WARNING: EasyOCR not available. PII detection will be limited.")
+    pass
+except Exception as e:
+    print(f"PaddleOCR import warning: {e}")
+
+# Fallback to EasyOCR if PaddleOCR not available
+if not OCR_AVAILABLE:
+    try:
+        import easyocr
+        OCR_ENGINE = "easyocr"
+        OCR_AVAILABLE = True
+        print("EasyOCR loaded successfully")
+    except ImportError as e:
+        print(f"EasyOCR not available: {e}")
+    except Exception as e:
+        print(f"EasyOCR import error: {e}")
+
+if not OCR_AVAILABLE:
+    print("WARNING: No OCR engine available. PII detection will be limited.")
+    print("Install with: pip install paddlepaddle-gpu paddleocr")
 
 # TensorFlow GPU configuration (CRITICAL)
 import tensorflow as tf
@@ -98,27 +123,41 @@ except:
 GPU_AVAILABLE = TF_GPU_AVAILABLE or ONNX_GPU_AVAILABLE
 print(f"Overall GPU Available: {GPU_AVAILABLE}")
 
-# ==================== EASYOCR INITIALIZATION (GPU-ACCELERATED) ====================
+# ==================== OCR INITIALIZATION (GPU-ACCELERATED) ====================
 
 OCR_GPU_AVAILABLE = False
-ocr_reader = None
 
-if EASYOCR_AVAILABLE:
-    try:
-        # Initialize EasyOCR with GPU support
-        # EasyOCR uses PyTorch which can utilize CUDA
-        use_gpu = GPU_AVAILABLE
-        print(f"Initializing EasyOCR with GPU: {use_gpu}...")
-        ocr_reader = easyocr.Reader(['en'], gpu=use_gpu, verbose=False)
-        OCR_GPU_AVAILABLE = use_gpu
-        print(f"EasyOCR initialized successfully (GPU: {OCR_GPU_AVAILABLE})")
-    except Exception as e:
-        print(f"EasyOCR initialization error: {e}")
-        print("EasyOCR will be unavailable for PII detection")
-        ocr_reader = None
-        OCR_GPU_AVAILABLE = False
+if OCR_AVAILABLE:
+    if OCR_ENGINE == "paddleocr":
+        try:
+            # Initialize PaddleOCR with GPU support
+            use_gpu = GPU_AVAILABLE
+            print(f"Initializing PaddleOCR with GPU: {use_gpu}...")
+            paddleocr_instance = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=use_gpu, show_log=False)
+            OCR_GPU_AVAILABLE = use_gpu
+            print(f"PaddleOCR initialized successfully (GPU: {OCR_GPU_AVAILABLE})")
+        except Exception as e:
+            print(f"PaddleOCR initialization error: {e}")
+            print("PaddleOCR will be unavailable for PII detection")
+            paddleocr_instance = None
+            OCR_GPU_AVAILABLE = False
+            OCR_AVAILABLE = False
+    elif OCR_ENGINE == "easyocr":
+        try:
+            # Initialize EasyOCR with GPU support
+            use_gpu = GPU_AVAILABLE
+            print(f"Initializing EasyOCR with GPU: {use_gpu}...")
+            easyocr_reader = easyocr.Reader(['en'], gpu=use_gpu, verbose=False)
+            OCR_GPU_AVAILABLE = use_gpu
+            print(f"EasyOCR initialized successfully (GPU: {OCR_GPU_AVAILABLE})")
+        except Exception as e:
+            print(f"EasyOCR initialization error: {e}")
+            print("EasyOCR will be unavailable for PII detection")
+            easyocr_reader = None
+            OCR_GPU_AVAILABLE = False
+            OCR_AVAILABLE = False
 else:
-    print("EasyOCR not installed. Install with: pip install easyocr")
+    print("No OCR engine available. Install with: pip install paddlepaddle-gpu paddleocr")
 
 
 # ==================== STAGE 1 CONFIGURATION ====================
@@ -1665,7 +1704,7 @@ def detect_pii_in_image(img_path: str) -> Dict:
         Dict with status (PASS/FAIL/REVIEW), detected PII types, and details
     """
     try:
-        if not EASYOCR_AVAILABLE or ocr_reader is None:
+        if not OCR_AVAILABLE:
             return {
                 "status": "REVIEW",
                 "reason": "OCR not available for PII detection",
@@ -1673,6 +1712,7 @@ def detect_pii_in_image(img_path: str) -> Dict:
                 "pii_types": [],
                 "detected_text": None,
                 "ocr_available": False,
+                "ocr_engine": None,
                 "gpu_used": False
             }
 
@@ -1686,16 +1726,43 @@ def detect_pii_in_image(img_path: str) -> Dict:
                 "pii_types": [],
                 "detected_text": None,
                 "ocr_available": True,
+                "ocr_engine": OCR_ENGINE,
                 "gpu_used": OCR_GPU_AVAILABLE
             }
 
-        print(f"[PII Detection GPU] Running OCR on image (GPU: {OCR_GPU_AVAILABLE})...")
+        print(f"[PII Detection GPU] Running {OCR_ENGINE} on image (GPU: {OCR_GPU_AVAILABLE})...")
 
-        # Run OCR on the image
-        # EasyOCR returns list of (bbox, text, confidence)
-        ocr_results = ocr_reader.readtext(img)
+        # Run OCR on the image based on engine
+        detected_texts = []
 
-        if not ocr_results:
+        if OCR_ENGINE == "paddleocr" and paddleocr_instance is not None:
+            # PaddleOCR returns list of [boxes, (text, confidence)]
+            ocr_results = paddleocr_instance.ocr(img_path, cls=True)
+            if ocr_results and ocr_results[0]:
+                for line in ocr_results[0]:
+                    if line and len(line) >= 2:
+                        bbox = line[0]
+                        text = line[1][0]
+                        confidence = line[1][1]
+                        if confidence > 0.3:
+                            detected_texts.append({
+                                "text": text,
+                                "confidence": confidence,
+                                "bbox": bbox
+                            })
+        elif OCR_ENGINE == "easyocr" and easyocr_reader is not None:
+            # EasyOCR returns list of (bbox, text, confidence)
+            ocr_results = easyocr_reader.readtext(img)
+            if ocr_results:
+                for (bbox, text, confidence) in ocr_results:
+                    if confidence > 0.3:
+                        detected_texts.append({
+                            "text": text,
+                            "confidence": confidence,
+                            "bbox": bbox
+                        })
+
+        if not detected_texts:
             return {
                 "status": "PASS",
                 "reason": "No text detected in image",
@@ -1703,27 +1770,7 @@ def detect_pii_in_image(img_path: str) -> Dict:
                 "pii_types": [],
                 "detected_text": [],
                 "ocr_available": True,
-                "gpu_used": OCR_GPU_AVAILABLE
-            }
-
-        # Extract text with confidence > 0.3
-        detected_texts = []
-        for (bbox, text, confidence) in ocr_results:
-            if confidence > 0.3:
-                detected_texts.append({
-                    "text": text,
-                    "confidence": confidence,
-                    "bbox": bbox
-                })
-
-        if not detected_texts:
-            return {
-                "status": "PASS",
-                "reason": "No readable text detected in image",
-                "pii_detected": False,
-                "pii_types": [],
-                "detected_text": [],
-                "ocr_available": True,
+                "ocr_engine": OCR_ENGINE,
                 "gpu_used": OCR_GPU_AVAILABLE
             }
 
@@ -1780,6 +1827,7 @@ def detect_pii_in_image(img_path: str) -> Dict:
                     "detected_text": detected_texts,
                     "severity": "CRITICAL",
                     "ocr_available": True,
+                    "ocr_engine": OCR_ENGINE,
                     "gpu_used": OCR_GPU_AVAILABLE
                 }
             elif has_social:
@@ -1792,6 +1840,7 @@ def detect_pii_in_image(img_path: str) -> Dict:
                     "detected_text": detected_texts,
                     "severity": "HIGH",
                     "ocr_available": True,
+                    "ocr_engine": OCR_ENGINE,
                     "gpu_used": OCR_GPU_AVAILABLE
                 }
             else:
@@ -1804,6 +1853,7 @@ def detect_pii_in_image(img_path: str) -> Dict:
                     "detected_text": detected_texts,
                     "severity": "MEDIUM",
                     "ocr_available": True,
+                    "ocr_engine": OCR_ENGINE,
                     "gpu_used": OCR_GPU_AVAILABLE
                 }
 
@@ -1814,6 +1864,7 @@ def detect_pii_in_image(img_path: str) -> Dict:
             "pii_types": [],
             "detected_text": detected_texts,
             "ocr_available": True,
+            "ocr_engine": OCR_ENGINE,
             "gpu_used": OCR_GPU_AVAILABLE
         }
 
@@ -1826,7 +1877,8 @@ def detect_pii_in_image(img_path: str) -> Dict:
             "pii_types": [],
             "detected_text": None,
             "error": str(e),
-            "ocr_available": EASYOCR_AVAILABLE,
+            "ocr_available": OCR_AVAILABLE,
+            "ocr_engine": OCR_ENGINE,
             "gpu_used": OCR_GPU_AVAILABLE
         }
 
@@ -1988,14 +2040,13 @@ def stage2_validate_hybrid(
     results["checks"]["ai_generated"] = detect_ai_generated(image_path)
     results["checks_performed"].append("ai_generated")
 
-    # 9. PII Detection (EASYOCR - GPU-ACCELERATED)
-    print("[P3 GPU] Checking for PII (text detection with GPU OCR)...")
+    # 9. PII Detection (OCR - GPU-ACCELERATED)
+    print(f"[P3 GPU] Checking for PII (text detection with {OCR_ENGINE or 'no'} OCR)...")
     results["checks"]["pii_detection"] = detect_pii_in_image(image_path)
     results["checks_performed"].append("pii_detection")
-    if OCR_GPU_AVAILABLE:
-        results["library_usage"]["easyocr"] = ["text_detection (GPU)", "pii_detection (GPU)"]
-    elif EASYOCR_AVAILABLE:
-        results["library_usage"]["easyocr"] = ["text_detection (CPU)", "pii_detection (CPU)"]
+    if OCR_AVAILABLE and OCR_ENGINE:
+        gpu_label = "GPU" if OCR_GPU_AVAILABLE else "CPU"
+        results["library_usage"][OCR_ENGINE] = [f"text_detection ({gpu_label})", f"pii_detection ({gpu_label})"]
 
     # ============= FINAL DECISION LOGIC =============
     
