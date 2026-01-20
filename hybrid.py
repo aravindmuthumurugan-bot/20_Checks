@@ -123,42 +123,97 @@ except:
 GPU_AVAILABLE = TF_GPU_AVAILABLE or ONNX_GPU_AVAILABLE
 print(f"Overall GPU Available: {GPU_AVAILABLE}")
 
-# ==================== OCR INITIALIZATION (GPU-ACCELERATED) ====================
+# ==================== OCR INITIALIZATION (THREAD-SAFE LAZY INIT) ====================
 
-OCR_GPU_AVAILABLE = False
+import threading
+
+# OCR will be initialized lazily on first use to avoid GPU conflicts at startup
+OCR_GPU_AVAILABLE = GPU_AVAILABLE if OCR_AVAILABLE else False
+OCR_INITIALIZED = False
+_ocr_init_lock = threading.Lock()  # Thread-safe initialization lock
+
+def get_ocr_instance():
+    """
+    Thread-safe lazy initialization of OCR to avoid GPU conflicts at startup.
+    Uses double-checked locking pattern for efficiency in production.
+    """
+    global paddleocr_instance, easyocr_reader, OCR_AVAILABLE, OCR_GPU_AVAILABLE, OCR_INITIALIZED
+
+    # Fast path - already initialized (no lock needed)
+    if OCR_INITIALIZED:
+        if OCR_ENGINE == "paddleocr":
+            return paddleocr_instance
+        elif OCR_ENGINE == "easyocr":
+            return easyocr_reader
+        return None
+
+    if not OCR_AVAILABLE:
+        return None
+
+    # Slow path - need to initialize (with lock for thread safety)
+    with _ocr_init_lock:
+        # Double-check after acquiring lock (another thread may have initialized)
+        if OCR_INITIALIZED:
+            if OCR_ENGINE == "paddleocr":
+                return paddleocr_instance
+            elif OCR_ENGINE == "easyocr":
+                return easyocr_reader
+            return None
+
+        if OCR_ENGINE == "paddleocr":
+            try:
+                print(f"[OCR Init] Initializing PaddleOCR (thread-safe, GPU auto-detect)...")
+                # Simple initialization - PaddleOCR auto-detects GPU
+                paddleocr_instance = PaddleOCR(use_angle_cls=True, lang='en')
+                OCR_GPU_AVAILABLE = GPU_AVAILABLE
+                OCR_INITIALIZED = True
+                print(f"[OCR Init] PaddleOCR initialized successfully")
+                return paddleocr_instance
+            except Exception as e:
+                print(f"[OCR Init] PaddleOCR initialization error: {e}")
+                paddleocr_instance = None
+                OCR_AVAILABLE = False
+                OCR_GPU_AVAILABLE = False
+                return None
+        elif OCR_ENGINE == "easyocr":
+            try:
+                print(f"[OCR Init] Initializing EasyOCR (thread-safe, GPU: {GPU_AVAILABLE})...")
+                easyocr_reader = easyocr.Reader(['en'], gpu=GPU_AVAILABLE, verbose=False)
+                OCR_GPU_AVAILABLE = GPU_AVAILABLE
+                OCR_INITIALIZED = True
+                print(f"[OCR Init] EasyOCR initialized successfully")
+                return easyocr_reader
+            except Exception as e:
+                print(f"[OCR Init] EasyOCR initialization error: {e}")
+                easyocr_reader = None
+                OCR_AVAILABLE = False
+                OCR_GPU_AVAILABLE = False
+                return None
+
+    return None
+
+
+def warmup_ocr():
+    """
+    Pre-initialize OCR engine during server startup (after other GPU libs).
+    Call this from API startup event to avoid first-request delay.
+    """
+    if not OCR_AVAILABLE:
+        print("[OCR Warmup] No OCR engine available, skipping warmup")
+        return False
+
+    print(f"[OCR Warmup] Pre-initializing {OCR_ENGINE} for production...")
+    instance = get_ocr_instance()
+    if instance is not None:
+        print(f"[OCR Warmup] {OCR_ENGINE} ready for production (no first-request delay)")
+        return True
+    else:
+        print(f"[OCR Warmup] Failed to initialize {OCR_ENGINE}")
+        return False
+
 
 if OCR_AVAILABLE:
-    if OCR_ENGINE == "paddleocr":
-        try:
-            # Initialize PaddleOCR with GPU support
-            # Note: PaddleOCR 2.7+ uses different parameters
-            # It auto-detects GPU if paddlepaddle-gpu is installed
-            use_gpu = GPU_AVAILABLE
-            print(f"Initializing PaddleOCR with GPU: {use_gpu}...")
-            # Simple initialization - PaddleOCR auto-detects GPU
-            paddleocr_instance = PaddleOCR(use_angle_cls=True, lang='en')
-            OCR_GPU_AVAILABLE = use_gpu  # Assume GPU if paddlepaddle-gpu is installed
-            print(f"PaddleOCR initialized successfully (GPU: {OCR_GPU_AVAILABLE})")
-        except Exception as e:
-            print(f"PaddleOCR initialization error: {e}")
-            print("PaddleOCR will be unavailable for PII detection")
-            paddleocr_instance = None
-            OCR_GPU_AVAILABLE = False
-            OCR_AVAILABLE = False
-    elif OCR_ENGINE == "easyocr":
-        try:
-            # Initialize EasyOCR with GPU support
-            use_gpu = GPU_AVAILABLE
-            print(f"Initializing EasyOCR with GPU: {use_gpu}...")
-            easyocr_reader = easyocr.Reader(['en'], gpu=use_gpu, verbose=False)
-            OCR_GPU_AVAILABLE = use_gpu
-            print(f"EasyOCR initialized successfully (GPU: {OCR_GPU_AVAILABLE})")
-        except Exception as e:
-            print(f"EasyOCR initialization error: {e}")
-            print("EasyOCR will be unavailable for PII detection")
-            easyocr_reader = None
-            OCR_GPU_AVAILABLE = False
-            OCR_AVAILABLE = False
+    print(f"OCR Engine: {OCR_ENGINE} (thread-safe lazy init on first use)")
 else:
     print("No OCR engine available. Install with: pip install paddlepaddle-gpu paddleocr")
 
@@ -1733,14 +1788,28 @@ def detect_pii_in_image(img_path: str) -> Dict:
                 "gpu_used": OCR_GPU_AVAILABLE
             }
 
-        print(f"[PII Detection GPU] Running {OCR_ENGINE} on image (GPU: {OCR_GPU_AVAILABLE})...")
+        # Get OCR instance (lazy initialization)
+        ocr_instance = get_ocr_instance()
+        if ocr_instance is None:
+            return {
+                "status": "REVIEW",
+                "reason": "OCR initialization failed",
+                "pii_detected": False,
+                "pii_types": [],
+                "detected_text": None,
+                "ocr_available": False,
+                "ocr_engine": OCR_ENGINE,
+                "gpu_used": False
+            }
+
+        print(f"[PII Detection] Running {OCR_ENGINE} on image (GPU: {OCR_GPU_AVAILABLE})...")
 
         # Run OCR on the image based on engine
         detected_texts = []
 
-        if OCR_ENGINE == "paddleocr" and paddleocr_instance is not None:
+        if OCR_ENGINE == "paddleocr":
             # PaddleOCR returns list of [boxes, (text, confidence)]
-            ocr_results = paddleocr_instance.ocr(img_path, cls=True)
+            ocr_results = ocr_instance.ocr(img_path, cls=True)
             if ocr_results and ocr_results[0]:
                 for line in ocr_results[0]:
                     if line and len(line) >= 2:
@@ -1753,9 +1822,9 @@ def detect_pii_in_image(img_path: str) -> Dict:
                                 "confidence": confidence,
                                 "bbox": bbox
                             })
-        elif OCR_ENGINE == "easyocr" and easyocr_reader is not None:
+        elif OCR_ENGINE == "easyocr":
             # EasyOCR returns list of (bbox, text, confidence)
-            ocr_results = easyocr_reader.readtext(img)
+            ocr_results = ocr_instance.readtext(img)
             if ocr_results:
                 for (bbox, text, confidence) in ocr_results:
                     if confidence > 0.3:

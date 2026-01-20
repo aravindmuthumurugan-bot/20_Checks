@@ -15,7 +15,15 @@ import numpy as np
 import time
 
 # Import validation system
-from hybrid import validate_photo_complete_hybrid, GPU_AVAILABLE, TF_GPU_AVAILABLE, ONNX_GPU_AVAILABLE
+from hybrid import (
+    validate_photo_complete_hybrid,
+    GPU_AVAILABLE,
+    TF_GPU_AVAILABLE,
+    ONNX_GPU_AVAILABLE,
+    OCR_AVAILABLE,
+    OCR_ENGINE,
+    warmup_ocr
+)
 
 app = FastAPI(
     title="Photo Validation API - Hybrid GPU",
@@ -577,14 +585,21 @@ async def gpu_info():
 async def startup_event():
     temp_dir = os.path.join(tempfile.gettempdir(), "photo_uploads")
     os.makedirs(temp_dir, exist_ok=True)
-    
+
     print("="*70)
     print("Photo Validation API - Full GPU v3.0.0")
     print("="*70)
     print(f"InsightFace GPU: {ONNX_GPU_AVAILABLE}")
     print(f"DeepFace GPU: {TF_GPU_AVAILABLE}")
     print(f"NudeNet GPU: {ONNX_GPU_AVAILABLE}")
+    print(f"OCR Engine: {OCR_ENGINE if OCR_AVAILABLE else 'None'}")
     print("="*70)
+
+    # Pre-initialize OCR for production (avoids first-request delay)
+    if OCR_AVAILABLE:
+        print("\n[Startup] Warming up OCR engine for production...")
+        warmup_ocr()
+        print("[Startup] OCR warmup complete - ready for fast responses\n")
 
 @app.on_event("shutdown")
 async def shutdown_event():
