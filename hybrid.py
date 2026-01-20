@@ -131,10 +131,13 @@ if OCR_AVAILABLE:
     if OCR_ENGINE == "paddleocr":
         try:
             # Initialize PaddleOCR with GPU support
+            # Note: PaddleOCR 2.7+ uses different parameters
+            # It auto-detects GPU if paddlepaddle-gpu is installed
             use_gpu = GPU_AVAILABLE
             print(f"Initializing PaddleOCR with GPU: {use_gpu}...")
-            paddleocr_instance = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=use_gpu, show_log=False)
-            OCR_GPU_AVAILABLE = use_gpu
+            # Simple initialization - PaddleOCR auto-detects GPU
+            paddleocr_instance = PaddleOCR(use_angle_cls=True, lang='en')
+            OCR_GPU_AVAILABLE = use_gpu  # Assume GPU if paddlepaddle-gpu is installed
             print(f"PaddleOCR initialized successfully (GPU: {OCR_GPU_AVAILABLE})")
         except Exception as e:
             print(f"PaddleOCR initialization error: {e}")
