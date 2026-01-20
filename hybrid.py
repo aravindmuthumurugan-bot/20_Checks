@@ -3,6 +3,7 @@ import os
 import numpy as np
 import base64
 import tempfile
+import re
 from typing import Dict, List, Tuple, Optional
 from retinaface import RetinaFace
 from nudenet import NudeDetector
@@ -14,6 +15,15 @@ from insightface.model_zoo import get_model
 
 # DeepFace imports (AGE & ETHNICITY ONLY)
 from deepface import DeepFace
+
+# EasyOCR for GPU-accelerated text detection (PII Check)
+try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+    print("EasyOCR loaded successfully")
+except ImportError:
+    EASYOCR_AVAILABLE = False
+    print("WARNING: EasyOCR not available. PII detection will be limited.")
 
 # TensorFlow GPU configuration (CRITICAL)
 import tensorflow as tf
@@ -87,6 +97,28 @@ except:
 # Combined GPU availability
 GPU_AVAILABLE = TF_GPU_AVAILABLE or ONNX_GPU_AVAILABLE
 print(f"Overall GPU Available: {GPU_AVAILABLE}")
+
+# ==================== EASYOCR INITIALIZATION (GPU-ACCELERATED) ====================
+
+OCR_GPU_AVAILABLE = False
+ocr_reader = None
+
+if EASYOCR_AVAILABLE:
+    try:
+        # Initialize EasyOCR with GPU support
+        # EasyOCR uses PyTorch which can utilize CUDA
+        use_gpu = GPU_AVAILABLE
+        print(f"Initializing EasyOCR with GPU: {use_gpu}...")
+        ocr_reader = easyocr.Reader(['en'], gpu=use_gpu, verbose=False)
+        OCR_GPU_AVAILABLE = use_gpu
+        print(f"EasyOCR initialized successfully (GPU: {OCR_GPU_AVAILABLE})")
+    except Exception as e:
+        print(f"EasyOCR initialization error: {e}")
+        print("EasyOCR will be unavailable for PII detection")
+        ocr_reader = None
+        OCR_GPU_AVAILABLE = False
+else:
+    print("EasyOCR not installed. Install with: pip install easyocr")
 
 
 # ==================== STAGE 1 CONFIGURATION ====================
@@ -1550,6 +1582,255 @@ def detect_ai_generated(img_path: str) -> Dict:
         }
 
 
+# ==================== PII DETECTION (GPU-ACCELERATED OCR) ====================
+
+# PII Pattern Definitions
+PII_PATTERNS = {
+    # Indian mobile numbers: 10 digits starting with 6-9, with optional +91 or 0 prefix
+    "mobile_number": [
+        r'\+91[\s\-]?[6-9]\d{9}',           # +91 9876543210 or +91-9876543210
+        r'\b0?[6-9]\d{9}\b',                 # 9876543210 or 09876543210
+        r'\b[6-9]\d{4}[\s\-]?\d{5}\b',       # 98765 43210 or 98765-43210
+        r'\b[6-9]\d{2}[\s\-]?\d{3}[\s\-]?\d{4}\b',  # 987-654-3210
+    ],
+    # Email addresses
+    "email": [
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+        r'\b[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\s*\.\s*[A-Z|a-z]{2,}\b',  # With spaces
+    ],
+    # Instagram IDs
+    "instagram": [
+        r'@[A-Za-z0-9_.]{1,30}\b',           # @username
+        r'\binsta\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,30}\b',  # insta: username or insta @username
+        r'\binstagram\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,30}\b',  # instagram: username
+        r'\big\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,30}\b',  # ig: username
+    ],
+    # WhatsApp numbers (similar to mobile but with WA prefix)
+    "whatsapp": [
+        r'\bwa\s*[:\-]?\s*\+?91?[\s\-]?[6-9]\d{9}\b',  # wa: +919876543210
+        r'\bwhatsapp\s*[:\-]?\s*\+?91?[\s\-]?[6-9]\d{9}\b',
+    ],
+    # Facebook IDs
+    "facebook": [
+        r'\bfb\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,50}\b',  # fb: username
+        r'\bfacebook\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,50}\b',
+    ],
+    # Snapchat IDs
+    "snapchat": [
+        r'\bsnap\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,30}\b',
+        r'\bsnapchat\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,30}\b',
+        r'\bsc\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,30}\b',
+    ],
+    # Telegram IDs
+    "telegram": [
+        r'\btelegram\s*[:\-]?\s*@?[A-Za-z0-9_]{5,32}\b',
+        r'\btg\s*[:\-]?\s*@?[A-Za-z0-9_]{5,32}\b',
+    ],
+    # Generic contact sharing patterns
+    "contact_info": [
+        r'\bcall\s*me\s*[:\-]?\s*\d+',
+        r'\bcontact\s*[:\-]?\s*\d+',
+        r'\btext\s*me\s*[:\-]?\s*\d+',
+        r'\bmsg\s*me\s*[:\-]?\s*\d+',
+        r'\bping\s*me\s*[:\-]?\s*\d+',
+        r'\bdm\s*me\b',
+    ],
+}
+
+# Words/patterns to exclude from false positives
+PII_EXCLUDE_PATTERNS = [
+    r'^@\d+$',  # Just @number (often photo metadata)
+    r'^@[a-z]$',  # Single letter usernames
+    r'@gmail\.com$',  # Full email shouldn't trigger instagram
+    r'@yahoo\.com$',
+    r'@hotmail\.com$',
+]
+
+
+def detect_pii_in_image(img_path: str) -> Dict:
+    """
+    Detect Personal Identifiable Information (PII) in images using GPU-accelerated OCR.
+
+    Detects:
+    - Mobile numbers (Indian format)
+    - Email addresses
+    - Instagram IDs
+    - WhatsApp numbers
+    - Facebook IDs
+    - Snapchat IDs
+    - Telegram IDs
+    - Generic contact sharing patterns
+
+    Returns:
+        Dict with status (PASS/FAIL/REVIEW), detected PII types, and details
+    """
+    try:
+        if not EASYOCR_AVAILABLE or ocr_reader is None:
+            return {
+                "status": "REVIEW",
+                "reason": "OCR not available for PII detection",
+                "pii_detected": False,
+                "pii_types": [],
+                "detected_text": None,
+                "ocr_available": False,
+                "gpu_used": False
+            }
+
+        # Read image
+        img = cv2.imread(img_path)
+        if img is None:
+            return {
+                "status": "REVIEW",
+                "reason": "Could not read image for PII detection",
+                "pii_detected": False,
+                "pii_types": [],
+                "detected_text": None,
+                "ocr_available": True,
+                "gpu_used": OCR_GPU_AVAILABLE
+            }
+
+        print(f"[PII Detection GPU] Running OCR on image (GPU: {OCR_GPU_AVAILABLE})...")
+
+        # Run OCR on the image
+        # EasyOCR returns list of (bbox, text, confidence)
+        ocr_results = ocr_reader.readtext(img)
+
+        if not ocr_results:
+            return {
+                "status": "PASS",
+                "reason": "No text detected in image",
+                "pii_detected": False,
+                "pii_types": [],
+                "detected_text": [],
+                "ocr_available": True,
+                "gpu_used": OCR_GPU_AVAILABLE
+            }
+
+        # Extract text with confidence > 0.3
+        detected_texts = []
+        for (bbox, text, confidence) in ocr_results:
+            if confidence > 0.3:
+                detected_texts.append({
+                    "text": text,
+                    "confidence": confidence,
+                    "bbox": bbox
+                })
+
+        if not detected_texts:
+            return {
+                "status": "PASS",
+                "reason": "No readable text detected in image",
+                "pii_detected": False,
+                "pii_types": [],
+                "detected_text": [],
+                "ocr_available": True,
+                "gpu_used": OCR_GPU_AVAILABLE
+            }
+
+        # Combine all detected text for pattern matching
+        full_text = " ".join([t["text"] for t in detected_texts])
+
+        print(f"[PII Detection GPU] Detected text: {full_text[:100]}...")
+
+        # Check for PII patterns
+        pii_found = []
+        pii_details = {}
+
+        for pii_type, patterns in PII_PATTERNS.items():
+            for pattern in patterns:
+                matches = re.findall(pattern, full_text, re.IGNORECASE)
+                if matches:
+                    # Filter out excluded patterns
+                    valid_matches = []
+                    for match in matches:
+                        is_excluded = False
+                        for exclude_pattern in PII_EXCLUDE_PATTERNS:
+                            if re.match(exclude_pattern, match, re.IGNORECASE):
+                                is_excluded = True
+                                break
+                        if not is_excluded:
+                            valid_matches.append(match)
+
+                    if valid_matches:
+                        if pii_type not in pii_found:
+                            pii_found.append(pii_type)
+                        if pii_type not in pii_details:
+                            pii_details[pii_type] = []
+                        pii_details[pii_type].extend(valid_matches)
+
+        # Remove duplicates from details
+        for pii_type in pii_details:
+            pii_details[pii_type] = list(set(pii_details[pii_type]))
+
+        if pii_found:
+            # Determine severity
+            critical_pii = ["mobile_number", "email", "whatsapp"]
+            social_pii = ["instagram", "facebook", "snapchat", "telegram"]
+
+            has_critical = any(pii in critical_pii for pii in pii_found)
+            has_social = any(pii in social_pii for pii in pii_found)
+
+            if has_critical:
+                return {
+                    "status": "FAIL",
+                    "reason": f"Personal contact information detected: {', '.join(pii_found)}",
+                    "pii_detected": True,
+                    "pii_types": pii_found,
+                    "pii_details": pii_details,
+                    "detected_text": detected_texts,
+                    "severity": "CRITICAL",
+                    "ocr_available": True,
+                    "gpu_used": OCR_GPU_AVAILABLE
+                }
+            elif has_social:
+                return {
+                    "status": "FAIL",
+                    "reason": f"Social media ID detected: {', '.join(pii_found)}",
+                    "pii_detected": True,
+                    "pii_types": pii_found,
+                    "pii_details": pii_details,
+                    "detected_text": detected_texts,
+                    "severity": "HIGH",
+                    "ocr_available": True,
+                    "gpu_used": OCR_GPU_AVAILABLE
+                }
+            else:
+                return {
+                    "status": "REVIEW",
+                    "reason": f"Potential contact sharing detected: {', '.join(pii_found)}",
+                    "pii_detected": True,
+                    "pii_types": pii_found,
+                    "pii_details": pii_details,
+                    "detected_text": detected_texts,
+                    "severity": "MEDIUM",
+                    "ocr_available": True,
+                    "gpu_used": OCR_GPU_AVAILABLE
+                }
+
+        return {
+            "status": "PASS",
+            "reason": "No PII detected in image text",
+            "pii_detected": False,
+            "pii_types": [],
+            "detected_text": detected_texts,
+            "ocr_available": True,
+            "gpu_used": OCR_GPU_AVAILABLE
+        }
+
+    except Exception as e:
+        print(f"[PII Detection GPU] Error: {str(e)}")
+        return {
+            "status": "REVIEW",
+            "reason": f"PII detection error: {str(e)}",
+            "pii_detected": False,
+            "pii_types": [],
+            "detected_text": None,
+            "error": str(e),
+            "ocr_available": EASYOCR_AVAILABLE,
+            "gpu_used": OCR_GPU_AVAILABLE
+        }
+
+
 # ==================== STAGE 2 MAIN VALIDATOR (HYBRID) ====================
 
 def stage2_validate_hybrid(
@@ -1603,7 +1884,7 @@ def stage2_validate_hybrid(
         results["reason"] = "SECONDARY photo validation completed in Stage 1"
         results["early_exit"] = True
         results["checks_skipped"] = ["age", "gender", "ethnicity", "face_coverage",
-                                     "enhancement", "photo_of_photo", "ai_generated"]
+                                     "enhancement", "photo_of_photo", "ai_generated", "pii_detection"]
         return results
 
     # ============= INSIGHTFACE ANALYSIS (BACKBONE) =============
@@ -1636,7 +1917,7 @@ def stage2_validate_hybrid(
             results["reason"] = "Underage detected - immediate suspension"
             results["early_exit"] = True
             results["checks_skipped"] = ["gender", "ethnicity", "face_coverage", "enhancement",
-                                         "photo_of_photo", "ai_generated"]
+                                         "photo_of_photo", "ai_generated", "pii_detection"]
             return results
     else:
         results["checks_skipped"].append("age")
@@ -1662,7 +1943,7 @@ def stage2_validate_hybrid(
             results["reason"] = "Gender mismatch detected"
             results["early_exit"] = True
             results["checks_skipped"].extend(["ethnicity", "face_coverage", "enhancement",
-                                         "photo_of_photo", "ai_generated"])
+                                         "photo_of_photo", "ai_generated", "pii_detection"])
             return results
 
         # 4. ETHNICITY CHECK (DEEPFACE - PRIMARY ONLY, GPU-ACCELERATED)
@@ -1677,7 +1958,7 @@ def stage2_validate_hybrid(
             results["reason"] = "Ethnicity check failed"
             results["early_exit"] = True
             results["checks_skipped"].extend(["face_coverage", "enhancement",
-                                         "photo_of_photo", "ai_generated"])
+                                         "photo_of_photo", "ai_generated", "pii_detection"])
             return results
     else:
         results["checks_skipped"].extend(["gender", "ethnicity"])
@@ -1706,7 +1987,16 @@ def stage2_validate_hybrid(
     # 8. AI-generated (OPENCV)
     results["checks"]["ai_generated"] = detect_ai_generated(image_path)
     results["checks_performed"].append("ai_generated")
-    
+
+    # 9. PII Detection (EASYOCR - GPU-ACCELERATED)
+    print("[P3 GPU] Checking for PII (text detection with GPU OCR)...")
+    results["checks"]["pii_detection"] = detect_pii_in_image(image_path)
+    results["checks_performed"].append("pii_detection")
+    if OCR_GPU_AVAILABLE:
+        results["library_usage"]["easyocr"] = ["text_detection (GPU)", "pii_detection (GPU)"]
+    elif EASYOCR_AVAILABLE:
+        results["library_usage"]["easyocr"] = ["text_detection (CPU)", "pii_detection (CPU)"]
+
     # ============= FINAL DECISION LOGIC =============
     
     fail_checks = []
@@ -1749,6 +2039,15 @@ def determine_rejection_action(fail_checks: List[str], all_checks: Dict) -> str:
 
     if any(check in fail_checks for check in ["gender", "ethnicity"]):
         return "SELFIE_VERIFICATION"
+
+    # PII Detection - reject photo with personal info
+    if "pii_detection" in fail_checks:
+        pii_check = all_checks.get("pii_detection", {})
+        severity = pii_check.get("severity", "HIGH")
+        if severity == "CRITICAL":
+            return "REJECT_PII_CONTACT_INFO"
+        else:
+            return "REJECT_PII_SOCIAL_MEDIA"
 
     if "enhancement" in fail_checks or any("enhancement" in check for check in fail_checks):
         return "NUDGE_UPLOAD_ORIGINAL"
@@ -1858,7 +2157,8 @@ def compile_checklist_summary(stage1_result: Dict, stage2_result: Optional[Dict]
             {"id": 14, "name": "Face Coverage (InsightFace)", "check_key": "face_coverage"},
             {"id": 15, "name": "Digital Enhancement", "check_key": "enhancement"},
             {"id": 16, "name": "Photo-of-Photo", "check_key": "photo_of_photo"},
-            {"id": 17, "name": "AI-Generated", "check_key": "ai_generated"}
+            {"id": 17, "name": "AI-Generated", "check_key": "ai_generated"},
+            {"id": 18, "name": "PII Detection (EasyOCR GPU)", "check_key": "pii_detection"}
         ]
         
         performed = stage2_result.get("checks_performed", [])
@@ -1874,7 +2174,8 @@ def compile_checklist_summary(stage1_result: Dict, stage2_result: Optional[Dict]
                     "age": "SECONDARY photos skip age check (family members have different ages)",
                     "gender": "SECONDARY photos skip gender check (family has both genders)",
                     "ethnicity": "SECONDARY photos skip ethnicity check (family members may differ)",
-                    "face_coverage": "SECONDARY photos skip face coverage (group photos have smaller faces)"
+                    "face_coverage": "SECONDARY photos skip face coverage (group photos have smaller faces)",
+                    "pii_detection": "SECONDARY photos skip PII detection (checked in Stage 1 context)"
                 }
                 
                 checklist["checks"].append({
