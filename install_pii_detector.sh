@@ -1,9 +1,9 @@
 #!/bin/bash
 
 ################################################################################
-# PII Detection System - Complete Installation Script
+# PII Detection System - Installation Script (No Sudo Required)
 # Optimized for: NVIDIA L40S GPU, CUDA 12.0, Python 3.10.13
-# Server: CHBLDEVLLMAIGPU01
+# User Space Installation
 ################################################################################
 
 set -e  # Exit on error
@@ -39,14 +39,15 @@ log_step() {
 
 clear
 echo "================================================================================"
-echo "         PII Detection System - GPU Installation Script"
+echo "         PII Detection System - User Space Installation"
 echo "         Optimized for NVIDIA L40S with CUDA 12.0"
+echo "         No Sudo Required!"
 echo "================================================================================"
 echo ""
 
 # Verify we're not running as root
 if [ "$EUID" -eq 0 ]; then 
-    log_error "Please do not run this script as root. Run as: ./install_pii_detector.sh"
+    log_error "Please do not run this script as root. Run as regular user."
     exit 1
 fi
 
@@ -86,7 +87,7 @@ if command -v nvidia-smi &> /dev/null; then
     log_info "Driver Version: $DRIVER_VERSION"
     log_info "GPU Memory: $GPU_MEMORY"
 else
-    log_error "nvidia-smi not found. NVIDIA drivers must be installed first."
+    log_error "nvidia-smi not found. NVIDIA drivers must be installed."
     exit 1
 fi
 
@@ -100,7 +101,7 @@ if command -v nvcc &> /dev/null; then
     CUDA_HOME=$(dirname $(dirname $(which nvcc)))
     log_info "CUDA Home: $CUDA_HOME"
 else
-    log_error "nvcc not found. CUDA Toolkit must be installed first."
+    log_error "nvcc not found. CUDA Toolkit must be installed."
     exit 1
 fi
 
@@ -126,105 +127,60 @@ log_success "Virtual environment created and activated"
 
 # Upgrade pip and setuptools
 log_step "Step 7: Upgrading pip, setuptools, and wheel..."
-pip install --upgrade pip setuptools wheel
+pip install --upgrade pip setuptools wheel --quiet
 log_success "Package managers upgraded"
 
-# Install system dependencies
-log_step "Step 8: Installing system dependencies..."
-log_info "This step requires sudo password..."
+# Check for system libraries (information only)
+log_step "Step 8: Checking system dependencies..."
+log_info "Checking for required system libraries..."
 
-if [[ "$OS" == *"Ubuntu"* ]] || [[ "$OS" == *"Debian"* ]]; then
-    sudo apt-get update -qq
-    sudo apt-get install -y \
-        build-essential \
-        cmake \
-        git \
-        wget \
-        curl \
-        unzip \
-        pkg-config \
-        libsm6 \
-        libxext6 \
-        libxrender-dev \
-        libgomp1 \
-        libglib2.0-0 \
-        libgl1-mesa-glx \
-        libglu1-mesa \
-        tesseract-ocr \
-        libtesseract-dev \
-        python3-dev \
-        libpython3.10-dev \
-        ffmpeg \
-        libsm6 \
-        libxext6 \
-        libfontconfig1 \
-        libxrender1 \
-        libjpeg-dev \
-        libpng-dev \
-        libtiff-dev \
-        libavcodec-dev \
-        libavformat-dev \
-        libswscale-dev \
-        libv4l-dev \
-        libatlas-base-dev \
-        gfortran \
-        > /dev/null 2>&1
-    
-    log_success "System dependencies installed"
-elif [[ "$OS" == *"CentOS"* ]] || [[ "$OS" == *"Red Hat"* ]] || [[ "$OS" == *"Rocky"* ]]; then
-    sudo yum update -y -q
-    sudo yum install -y \
-        gcc \
-        gcc-c++ \
-        cmake \
-        git \
-        wget \
-        curl \
-        unzip \
-        pkgconfig \
-        mesa-libGL \
-        tesseract \
-        tesseract-devel \
-        python3-devel \
-        ffmpeg \
-        atlas-devel \
-        > /dev/null 2>&1
-    
-    log_success "System dependencies installed"
-else
-    log_warning "Unknown OS. Some dependencies may need manual installation."
+MISSING_LIBS=()
+
+# Check for essential libraries
+check_lib() {
+    if ldconfig -p 2>/dev/null | grep -q "$1"; then
+        log_success "$1 found"
+        return 0
+    else
+        log_warning "$1 not found (may cause issues)"
+        MISSING_LIBS+=("$1")
+        return 1
+    fi
+}
+
+check_lib "libGL.so"
+check_lib "libglib-2.0.so"
+check_lib "libgomp.so"
+
+if [ ${#MISSING_LIBS[@]} -gt 0 ]; then
+    log_warning "Some system libraries are missing:"
+    for lib in "${MISSING_LIBS[@]}"; do
+        echo "  - $lib"
+    done
+    log_info "These are usually pre-installed. If you encounter errors, contact your system admin."
 fi
+log_success "System dependency check complete"
 
-# Install cuDNN (if not already installed)
-log_step "Step 9: Checking cuDNN installation..."
-if [ -f "/usr/include/cudnn.h" ] || [ -f "$CUDA_HOME/include/cudnn.h" ]; then
-    CUDNN_VERSION=$(grep CUDNN_MAJOR /usr/include/cudnn_version.h 2>/dev/null || grep CUDNN_MAJOR $CUDA_HOME/include/cudnn_version.h 2>/dev/null | awk '{print $3}')
-    log_success "cuDNN is already installed (version $CUDNN_VERSION)"
-else
-    log_warning "cuDNN not detected. Deep learning frameworks may have reduced performance."
-    log_info "To install cuDNN manually:"
-    log_info "  1. Download from: https://developer.nvidia.com/cudnn"
-    log_info "  2. Extract and copy to CUDA directory"
-fi
-
-# Install PyTorch with CUDA 12.0 support
-log_step "Step 10: Installing PyTorch with CUDA 12.0 support..."
-pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121
+# Install PyTorch with CUDA 12.1 support (closest to 12.0)
+log_step "Step 9: Installing PyTorch with CUDA 12.1 support..."
+log_info "This may take several minutes..."
+pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121 --quiet
 log_success "PyTorch installed"
 
 # Install TensorFlow with GPU support
-log_step "Step 11: Installing TensorFlow with GPU support..."
-pip install tensorflow[and-cuda]==2.15.0
+log_step "Step 10: Installing TensorFlow with GPU support..."
+log_info "This may take several minutes..."
+pip install tensorflow[and-cuda]==2.15.0 --quiet
 log_success "TensorFlow installed"
 
 # Install ONNX Runtime with GPU support
-log_step "Step 12: Installing ONNX Runtime GPU..."
-pip install onnxruntime-gpu==1.16.3
+log_step "Step 11: Installing ONNX Runtime GPU..."
+pip install onnxruntime-gpu==1.16.3 --quiet
 log_success "ONNX Runtime GPU installed"
 
 # Install core Python dependencies
-log_step "Step 13: Installing core Python dependencies..."
-pip install --upgrade \
+log_step "Step 12: Installing core Python dependencies..."
+pip install --quiet \
     fastapi==0.109.0 \
     uvicorn[standard]==0.27.0 \
     python-multipart==0.0.6 \
@@ -236,50 +192,50 @@ pip install --upgrade \
     pydantic==2.5.3 \
     python-dateutil==2.8.2 \
     requests==2.31.0 \
-    aiofiles==23.2.1 \
-    > /dev/null 2>&1
+    aiofiles==23.2.1
 
 log_success "Core dependencies installed"
 
 # Install EasyOCR with GPU support
-log_step "Step 14: Installing EasyOCR..."
-pip install easyocr==1.7.0
+log_step "Step 13: Installing EasyOCR..."
+pip install easyocr==1.7.0 --quiet
 log_success "EasyOCR installed"
 
 # Install additional ML libraries
-log_step "Step 15: Installing additional ML libraries..."
-pip install \
+log_step "Step 14: Installing additional ML libraries..."
+pip install --quiet \
     scikit-learn==1.3.2 \
     scipy==1.11.4 \
-    pandas==2.1.4 \
-    > /dev/null 2>&1
+    pandas==2.1.4
+
 log_success "Additional ML libraries installed"
 
 # Pre-download EasyOCR models
-log_step "Step 16: Pre-downloading EasyOCR models (this may take a few minutes)..."
+log_step "Step 15: Pre-downloading EasyOCR models..."
+log_info "This will download ~100MB of model data..."
 $PYTHON_CMD << 'EOF'
 import warnings
 warnings.filterwarnings('ignore')
-import easyocr
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-print("Initializing EasyOCR reader and downloading English model...")
+print("Downloading EasyOCR English model...")
 try:
+    import easyocr
     reader = easyocr.Reader(['en'], gpu=True, verbose=False)
-    print("✓ English model downloaded successfully!")
+    print("✓ Model downloaded successfully!")
 except Exception as e:
-    print(f"⚠ Model download completed with warning: {e}")
+    print(f"Model download status: {e}")
 EOF
 log_success "EasyOCR models downloaded"
 
 # Create directory structure
-log_step "Step 17: Creating directory structure..."
-mkdir -p "$PROJECT_DIR"/{uploads,outputs,logs,models,scripts,config}
+log_step "Step 16: Creating directory structure..."
+mkdir -p "$PROJECT_DIR"/{uploads,outputs,logs,models,scripts,config,temp}
 log_success "Directory structure created"
 
 # Create environment configuration
-log_step "Step 18: Creating environment configuration..."
+log_step "Step 17: Creating environment configuration..."
 cat > "$PROJECT_DIR/.env" << EOF
 # ============================================================================
 # PII Detection System - Environment Configuration
@@ -303,7 +259,7 @@ TF_XLA_FLAGS=--tf_xla_auto_jit=2
 # PyTorch Configuration
 PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 
-# OMP/MKL Settings (CPU threading)
+# OMP/MKL Settings
 OMP_NUM_THREADS=8
 MKL_NUM_THREADS=8
 
@@ -321,8 +277,8 @@ EOF
 log_success "Environment configuration created"
 
 # Update bashrc with CUDA paths
-log_step "Step 19: Updating shell environment..."
-if ! grep -q "CUDA_HOME=$CUDA_HOME" ~/.bashrc; then
+log_step "Step 18: Updating shell environment..."
+if ! grep -q "PII Detection System - CUDA Configuration" ~/.bashrc; then
     cat >> ~/.bashrc << EOF
 
 # ============================================================================
@@ -332,14 +288,28 @@ export CUDA_HOME=$CUDA_HOME
 export PATH=\$CUDA_HOME/bin:\$PATH
 export LD_LIBRARY_PATH=\$CUDA_HOME/lib64:\$LD_LIBRARY_PATH
 export CUDA_VISIBLE_DEVICES=0
+
+# CUDA Cache
+export CUDA_CACHE_PATH=\$HOME/.nv/ComputeCache
+mkdir -p \$CUDA_CACHE_PATH
+
+# TensorFlow
+export TF_FORCE_GPU_ALLOW_GROWTH=true
+
+# Alias for quick activation
+alias pii-activate='cd $PROJECT_DIR && source venv/bin/activate'
 EOF
     log_success "Shell environment updated"
 else
     log_info "CUDA paths already in .bashrc"
 fi
 
+# Create CUDA cache directory
+mkdir -p $HOME/.nv/ComputeCache
+log_success "CUDA cache directory created"
+
 # Create GPU test script
-log_step "Step 20: Creating GPU test script..."
+log_step "Step 19: Creating GPU test script..."
 cat > "$PROJECT_DIR/scripts/test_gpu.py" << 'EOF'
 #!/usr/bin/env python3
 """GPU Test and Verification Script"""
@@ -364,7 +334,6 @@ print(f"GPUs available: {len(gpus)}")
 
 if gpus:
     try:
-        # Set memory growth
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
         
@@ -372,7 +341,6 @@ if gpus:
         print(f"GPU Device: {gpus[0]}")
         print(f"GPU Name: {gpu_details.get('device_name', 'Unknown')}")
         
-        # Test computation
         print("\nTesting TensorFlow GPU computation...")
         with tf.device('/GPU:0'):
             a = tf.constant([[1.0, 2.0], [3.0, 4.0]])
@@ -399,7 +367,6 @@ if torch.cuda.is_available():
     print(f"Current GPU: {torch.cuda.current_device()}")
     print(f"GPU name: {torch.cuda.get_device_name(0)}")
     
-    # Test computation
     print("\nTesting PyTorch GPU computation...")
     x = torch.rand(3, 3).cuda()
     y = torch.rand(3, 3).cuda()
@@ -422,7 +389,7 @@ try:
     if 'CUDAExecutionProvider' in providers:
         print("✓ CUDA Execution Provider available!")
     else:
-        print("✗ CUDA Execution Provider not available")
+        print("⚠ CUDA Execution Provider not available")
 except ImportError:
     print("✗ ONNX Runtime not installed")
 
@@ -450,7 +417,7 @@ chmod +x "$PROJECT_DIR/scripts/test_gpu.py"
 log_success "GPU test script created"
 
 # Create GPU monitoring script
-log_step "Step 21: Creating GPU monitoring script..."
+log_step "Step 20: Creating GPU monitoring script..."
 cat > "$PROJECT_DIR/scripts/monitor_gpu.sh" << 'EOF'
 #!/bin/bash
 # Real-time GPU monitoring
@@ -458,6 +425,62 @@ watch -n 1 'nvidia-smi --query-gpu=timestamp,name,temperature.gpu,utilization.gp
 EOF
 chmod +x "$PROJECT_DIR/scripts/monitor_gpu.sh"
 log_success "GPU monitoring script created"
+
+# Create detailed monitoring script
+log_step "Step 21: Creating detailed monitoring script..."
+cat > "$PROJECT_DIR/scripts/monitor_gpu_detailed.sh" << 'EOF'
+#!/bin/bash
+# Detailed GPU Monitoring
+
+clear
+echo "================================================================================"
+echo "NVIDIA L40S GPU - Real-time Monitoring"
+echo "Press Ctrl+C to exit"
+echo "================================================================================"
+
+while true; do
+    clear
+    echo "================================================================================"
+    echo "GPU Status - $(date)"
+    echo "================================================================================"
+    
+    echo ""
+    echo "GPU Utilization:"
+    nvidia-smi --query-gpu=utilization.gpu,utilization.memory --format=csv,noheader,nounits | \
+        awk -F', ' '{printf "  GPU: %3d%%  Memory: %3d%%\n", $1, $2}'
+    
+    echo ""
+    echo "Temperature:"
+    nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits | \
+        awk '{printf "  GPU: %d°C\n", $1}'
+    
+    echo ""
+    echo "Power:"
+    nvidia-smi --query-gpu=power.draw,power.limit --format=csv,noheader,nounits | \
+        awk -F', ' '{printf "  Current: %.2f W / %.2f W (%.1f%%)\n", $1, $2, ($1/$2)*100}'
+    
+    echo ""
+    echo "Memory:"
+    nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits | \
+        awk -F', ' '{printf "  Used: %d MB / %d MB (%.1f%%)\n", $1, $2, ($1/$2)*100}'
+    
+    echo ""
+    echo "Clocks:"
+    nvidia-smi --query-gpu=clocks.gr,clocks.mem --format=csv,noheader,nounits | \
+        awk -F', ' '{printf "  Graphics: %d MHz  Memory: %d MHz\n", $1, $2}'
+    
+    echo ""
+    echo "Active Processes:"
+    nvidia-smi pmon -c 1 -s m 2>/dev/null | tail -n +3 | head -n 10
+    
+    echo ""
+    echo "================================================================================"
+    
+    sleep 2
+done
+EOF
+chmod +x "$PROJECT_DIR/scripts/monitor_gpu_detailed.sh"
+log_success "Detailed monitoring script created"
 
 # Create GPU benchmark script
 log_step "Step 22: Creating GPU benchmark script..."
@@ -472,7 +495,6 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 import torch
 import time
-import numpy as np
 
 print("="*80)
 print("NVIDIA L40S GPU BENCHMARK")
@@ -498,18 +520,13 @@ with tf.device('/GPU:0'):
         c = tf.matmul(a, b)
     
     elapsed = time.time() - start
-    ops_per_sec = iterations / elapsed
-    
     print(f"Iterations: {iterations}")
     print(f"Total time: {elapsed:.2f} seconds")
-    print(f"Operations/sec: {ops_per_sec:.2f}")
+    print(f"Operations/sec: {iterations/elapsed:.2f}")
     print(f"Avg time/op: {(elapsed/iterations)*1000:.2f} ms")
-    print(f"TFLOPS estimate: {(2 * 5000**3 * iterations / elapsed) / 1e12:.2f}")
 
 # PyTorch Benchmark
 print("\n--- PyTorch Benchmark ---")
-print("Matrix multiplication: 5000x5000 matrices")
-
 device = torch.device("cuda")
 
 # Warmup
@@ -521,7 +538,6 @@ for _ in range(5):
 
 # Benchmark
 start = time.time()
-iterations = 100
 for _ in range(iterations):
     a = torch.randn(5000, 5000, device=device)
     b = torch.randn(5000, 5000, device=device)
@@ -529,28 +545,10 @@ for _ in range(iterations):
     torch.cuda.synchronize()
 
 elapsed = time.time() - start
-ops_per_sec = iterations / elapsed
-
 print(f"Iterations: {iterations}")
 print(f"Total time: {elapsed:.2f} seconds")
-print(f"Operations/sec: {ops_per_sec:.2f}")
+print(f"Operations/sec: {iterations/elapsed:.2f}")
 print(f"Avg time/op: {(elapsed/iterations)*1000:.2f} ms")
-print(f"TFLOPS estimate: {(2 * 5000**3 * iterations / elapsed) / 1e12:.2f}")
-
-# Memory bandwidth test
-print("\n--- GPU Memory Bandwidth Test ---")
-size = 1024 * 1024 * 1024  # 1 GB
-iterations = 10
-
-data = torch.randn(size // 4, device=device)
-start = time.time()
-for _ in range(iterations):
-    _ = data.clone()
-    torch.cuda.synchronize()
-elapsed = time.time() - start
-
-bandwidth = (size * iterations / elapsed) / 1e9
-print(f"Memory bandwidth: {bandwidth:.2f} GB/s")
 
 print("\n--- GPU Memory Stats ---")
 props = torch.cuda.get_device_properties(0)
@@ -571,8 +569,6 @@ log_step "Step 23: Creating API startup script..."
 cat > "$PROJECT_DIR/start_api.sh" << 'EOF'
 #!/bin/bash
 
-# PII Detection API Startup Script
-
 echo "================================================================================"
 echo "Starting PII Detection API"
 echo "================================================================================"
@@ -592,7 +588,6 @@ if [ ! -f "main.py" ]; then
     exit 1
 fi
 
-# Start the API
 echo ""
 echo "API Server Starting..."
 echo "  - URL: http://0.0.0.0:8000"
@@ -643,43 +638,24 @@ aiofiles==23.2.1
 EOF
 log_success "requirements.txt created"
 
-# Create systemd service file
-log_step "Step 25: Creating systemd service (optional)..."
-sudo tee /etc/systemd/system/pii-detector.service > /dev/null << EOF
-[Unit]
-Description=PII Detection API Service
-After=network.target
-
-[Service]
-Type=simple
-User=$USER
-WorkingDirectory=$PROJECT_DIR
-Environment="PATH=$PROJECT_DIR/venv/bin"
-EnvironmentFile=$PROJECT_DIR/.env
-ExecStart=$PROJECT_DIR/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-sudo systemctl daemon-reload
-log_success "Systemd service created (not enabled)"
-
 # Create README
-log_step "Step 26: Creating README..."
+log_step "Step 25: Creating README..."
 cat > "$PROJECT_DIR/README.md" << 'EOF'
 # PII Detection System
 
-GPU-accelerated PII detection system for NVIDIA L40S.
+GPU-accelerated PII detection system for NVIDIA L40S (User Space Installation).
 
 ## Quick Start
 
 1. **Activate virtual environment:**
 ```bash
+   cd ~/pii_detection_system
    source venv/bin/activate
+```
+
+   Or use the alias:
+```bash
+   pii-activate
 ```
 
 2. **Test GPU:**
@@ -689,7 +665,7 @@ GPU-accelerated PII detection system for NVIDIA L40S.
 
 3. **Copy your FastAPI application:**
 ```bash
-   cp /path/to/your/main.py .
+   cp /path/to/your/main.py ~/pii_detection_system/main.py
 ```
 
 4. **Start API:**
@@ -701,7 +677,8 @@ GPU-accelerated PII detection system for NVIDIA L40S.
 
 - `scripts/test_gpu.py` - Test GPU functionality
 - `scripts/benchmark_gpu.py` - Benchmark GPU performance
-- `scripts/monitor_gpu.sh` - Monitor GPU usage in real-time
+- `scripts/monitor_gpu.sh` - Monitor GPU (simple)
+- `scripts/monitor_gpu_detailed.sh` - Monitor GPU (detailed)
 - `start_api.sh` - Start the API server
 
 ## API Endpoints
@@ -714,32 +691,110 @@ GPU-accelerated PII detection system for NVIDIA L40S.
 
 ## Monitoring
 ```bash
-# Real-time GPU monitoring
-./scripts/monitor_gpu.sh
-
-# Check GPU status
+# Simple monitoring
 nvidia-smi
 
-# View API logs (if using systemd)
-sudo journalctl -u pii-detector -f
+# Real-time monitoring
+./scripts/monitor_gpu.sh
+
+# Detailed monitoring
+./scripts/monitor_gpu_detailed.sh
 ```
 
-## Service Management
-```bash
-# Enable service
-sudo systemctl enable pii-detector
+## Troubleshooting
 
-# Start service
-sudo systemctl start pii-detector
-
-# Stop service
-sudo systemctl stop pii-detector
-
-# Check status
-sudo systemctl status pii-detector
-```
+If you encounter "library not found" errors, some system libraries may be missing.
+Contact your system administrator to install:
+- libGL.so (OpenGL)
+- libglib-2.0.so (GLib)
+- libgomp.so (OpenMP)
 EOF
 log_success "README created"
+
+# Create user guide
+log_step "Step 26: Creating user guide..."
+cat > "$PROJECT_DIR/USER_GUIDE.txt" << 'EOF'
+================================================================================
+PII DETECTION SYSTEM - USER GUIDE
+================================================================================
+
+QUICK ACTIVATION:
+-----------------
+Option 1: Use the alias
+  $ pii-activate
+
+Option 2: Manual activation
+  $ cd ~/pii_detection_system
+  $ source venv/bin/activate
+
+TESTING GPU:
+------------
+1. Test GPU functionality:
+   $ python3 scripts/test_gpu.py
+
+2. Benchmark GPU performance:
+   $ python3 scripts/benchmark_gpu.py
+
+RUNNING THE API:
+----------------
+1. Make sure you have copied main.py to the project directory
+   $ cp /path/to/main.py ~/pii_detection_system/
+
+2. Start the API:
+   $ cd ~/pii_detection_system
+   $ ./start_api.sh
+
+3. Access the API:
+   - API: http://localhost:8000
+   - Interactive docs: http://localhost:8000/docs
+
+MONITORING GPU:
+---------------
+Simple monitoring:
+  $ nvidia-smi
+
+Real-time monitoring:
+  $ cd ~/pii_detection_system
+  $ ./scripts/monitor_gpu.sh
+
+Detailed monitoring:
+  $ cd ~/pii_detection_system
+  $ ./scripts/monitor_gpu_detailed.sh
+
+TROUBLESHOOTING:
+----------------
+Problem: Import errors or "library not found"
+Solution: Some system libraries may be missing. Contact your system admin.
+
+Problem: GPU not detected by TensorFlow/PyTorch
+Solution: Check CUDA paths are set correctly:
+  $ echo $CUDA_HOME
+  $ echo $LD_LIBRARY_PATH
+
+Problem: Out of memory errors
+Solution: Reduce batch size or max_workers in API configuration
+
+USEFUL COMMANDS:
+----------------
+Check Python packages:
+  $ pip list | grep -E "torch|tensorflow|easyocr"
+
+Check GPU memory:
+  $ nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+
+Check GPU temperature:
+  $ nvidia-smi --query-gpu=temperature.gpu --format=csv
+
+Monitor GPU continuously:
+  $ watch -n 1 nvidia-smi
+
+DEACTIVATING ENVIRONMENT:
+-------------------------
+$ deactivate
+
+================================================================================
+EOF
+log_success "User guide created"
 
 # Run GPU test
 log_step "Step 27: Running GPU verification test..."
@@ -749,12 +804,12 @@ $PYTHON_CMD "$PROJECT_DIR/scripts/test_gpu.py"
 # Final summary
 echo ""
 echo "================================================================================"
-log_success "INSTALLATION COMPLETE!"
+log_success "INSTALLATION COMPLETE! (No sudo required)"
 echo "================================================================================"
 echo ""
-echo "Project Directory: $PROJECT_DIR"
+echo "📁 Project Directory: $PROJECT_DIR"
 echo ""
-echo "📁 Directory Structure:"
+echo "📂 Directory Structure:"
 echo "  ├── venv/              (Virtual environment)"
 echo "  ├── uploads/           (Uploaded images)"
 echo "  ├── outputs/           (Processed results)"
@@ -763,38 +818,44 @@ echo "  ├── scripts/           (Utility scripts)"
 echo "  ├── .env               (Environment configuration)"
 echo "  ├── requirements.txt   (Python dependencies)"
 echo "  ├── start_api.sh       (API startup script)"
-echo "  └── README.md          (Documentation)"
+echo "  ├── README.md          (Documentation)"
+echo "  └── USER_GUIDE.txt     (Detailed user guide)"
 echo ""
-echo "🚀 Next Steps:"
+echo "🚀 NEXT STEPS:"
 echo ""
-echo "  1. Copy your FastAPI application:"
-echo "     cp /path/to/main.py $PROJECT_DIR/main.py"
+echo "  1. Activate environment (choose one):"
+echo "     → pii-activate                    (use the alias)"
+echo "     → cd $PROJECT_DIR && source venv/bin/activate"
 echo ""
-echo "  2. Activate virtual environment:"
-echo "     cd $PROJECT_DIR"
-echo "     source venv/bin/activate"
+echo "  2. Copy your FastAPI application:"
+echo "     → cp /path/to/main.py $PROJECT_DIR/main.py"
 echo ""
-echo "  3. Test GPU (again if needed):"
-echo "     python3 scripts/test_gpu.py"
+echo "  3. Test GPU:"
+echo "     → python3 scripts/test_gpu.py"
 echo ""
-echo "  4. Run GPU benchmark:"
-echo "     python3 scripts/benchmark_gpu.py"
+echo "  4. Run benchmark:"
+echo "     → python3 scripts/benchmark_gpu.py"
 echo ""
-echo "  5. Start API server:"
-echo "     ./start_api.sh"
+echo "  5. Start API:"
+echo "     → ./start_api.sh"
 echo ""
-echo "📊 Monitoring:"
-echo "  - Real-time GPU: ./scripts/monitor_gpu.sh"
-echo "  - GPU status: nvidia-smi"
+echo "📊 MONITORING:"
+echo "  → nvidia-smi                          (GPU status)"
+echo "  → ./scripts/monitor_gpu.sh            (Real-time)"
+echo "  → ./scripts/monitor_gpu_detailed.sh   (Detailed)"
 echo ""
-echo "🌐 API Access:"
-echo "  - API: http://localhost:8001"
-echo "  - Docs: http://localhost:8001/docs"
+echo "🌐 API ACCESS (after starting):"
+echo "  → API: http://localhost:8001"
+echo "  → Interactive Docs: http://localhost:8001/docs"
 echo ""
-echo "⚙️  Service Management (optional):"
-echo "  - Enable: sudo systemctl enable pii-detector"
-echo "  - Start: sudo systemctl start pii-detector"
-echo "  - Status: sudo systemctl status pii-detector"
-echo "  - Logs: sudo journalctl -u pii-detector -f"
+echo "📖 DOCUMENTATION:"
+echo "  → README.md        (Quick reference)"
+echo "  → USER_GUIDE.txt   (Detailed guide)"
+echo ""
+echo "💡 TIP: Reload your shell to use the 'pii-activate' alias:"
+echo "  → source ~/.bashrc"
 echo ""
 echo "================================================================================"
+echo ""
+log_success "Installation successful! Your PII Detection System is ready to use."
+echo ""
