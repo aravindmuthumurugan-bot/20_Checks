@@ -24,12 +24,12 @@ OCR_AVAILABLE = False
 paddleocr_instance = None
 easyocr_reader = None
 
-# Try PaddleOCR first (recommended for GPU)
+# Try PaddleOCR first (will use CPU to avoid GPU conflicts)
 try:
     from paddleocr import PaddleOCR
     OCR_ENGINE = "paddleocr"
     OCR_AVAILABLE = True
-    print("PaddleOCR loaded successfully (GPU-accelerated)")
+    print("PaddleOCR loaded successfully (CPU mode to avoid GPU conflicts)")
 except ImportError:
     pass
 except Exception as e:
@@ -128,8 +128,8 @@ print(f"Overall GPU Available: {GPU_AVAILABLE}")
 
 import threading
 
-# OCR will be initialized lazily on first use to avoid GPU conflicts at startup
-OCR_GPU_AVAILABLE = GPU_AVAILABLE if OCR_AVAILABLE else False
+# OCR will be initialized lazily on first use (CPU mode to avoid GPU conflicts)
+OCR_GPU_AVAILABLE = False  # Force CPU mode for PaddleOCR
 OCR_INITIALIZED = False
 _ocr_init_lock = threading.Lock()  # Thread-safe initialization lock
 
@@ -163,12 +163,12 @@ def get_ocr_instance():
 
         if OCR_ENGINE == "paddleocr":
             try:
-                print(f"[OCR Init] Initializing PaddleOCR (thread-safe, GPU auto-detect)...")
-                # Simple initialization - PaddleOCR auto-detects GPU
-                paddleocr_instance = PaddleOCR(use_angle_cls=True, lang='en')
-                OCR_GPU_AVAILABLE = GPU_AVAILABLE
+                print(f"[OCR Init] Initializing PaddleOCR (thread-safe, CPU mode to avoid GPU conflicts)...")
+                # Use CPU mode to avoid GPU memory conflicts with TensorFlow/ONNX
+                paddleocr_instance = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
+                OCR_GPU_AVAILABLE = False  # Force CPU mode
                 OCR_INITIALIZED = True
-                print(f"[OCR Init] PaddleOCR initialized successfully")
+                print(f"[OCR Init] PaddleOCR initialized successfully (CPU mode)")
                 return paddleocr_instance
             except Exception as e:
                 print(f"[OCR Init] PaddleOCR initialization error: {e}")
@@ -203,10 +203,10 @@ def warmup_ocr():
         print("[OCR Warmup] No OCR engine available, skipping warmup")
         return False
 
-    print(f"[OCR Warmup] Pre-initializing {OCR_ENGINE} for production...")
+    print(f"[OCR Warmup] Pre-initializing {OCR_ENGINE} for production (CPU mode)...")
     instance = get_ocr_instance()
     if instance is not None:
-        print(f"[OCR Warmup] {OCR_ENGINE} ready for production (no first-request delay)")
+        print(f"[OCR Warmup] {OCR_ENGINE} ready for production (CPU mode, no first-request delay)")
         return True
     else:
         print(f"[OCR Warmup] Failed to initialize {OCR_ENGINE}")
@@ -214,7 +214,7 @@ def warmup_ocr():
 
 
 if OCR_AVAILABLE:
-    print(f"OCR Engine: {OCR_ENGINE} (thread-safe lazy init on first use)")
+    print(f"OCR Engine: {OCR_ENGINE} (thread-safe lazy init on first use, CPU mode)")
 else:
     print("No OCR engine available. Install with: pip install paddlepaddle-gpu paddleocr")
 
