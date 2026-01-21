@@ -75,22 +75,34 @@ TF_GPU_AVAILABLE = configure_gpu()
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 # Try to import GPU-related libraries for ONNX Runtime (InsightFace)
-try:
-    import onnxruntime as ort
-    providers = ort.get_available_providers()
-    if 'CUDAExecutionProvider' in providers:
-        ONNX_GPU_AVAILABLE = True
-        print(f"ONNX Runtime GPU Available: CUDA")
-    else:
-        ONNX_GPU_AVAILABLE = False
-        print("ONNX Runtime: Running on CPU")
-except:
-    ONNX_GPU_AVAILABLE = False
-    print("ONNX Runtime not available or GPU not detected")
+# try:
+#     import onnxruntime as ort    
+#     providers = ort.get_available_providers()
+#     if 'CUDAExecutionProvider' in providers:
+#         ONNX_GPU_AVAILABLE = True
+#         print(f"ONNX Runtime GPU Available: CUDA")
+#     else:
+#         ONNX_GPU_AVAILABLE = False
+#         print("ONNX Runtime: Running on CPU")
+# except:
+#     ONNX_GPU_AVAILABLE = False
+#     print("ONNX Runtime not available or GPU not detected")
+
+def real_onnx_gpu_available():
+    try:
+        import onnxruntime as ort
+        sess = ort.InferenceSession(
+            None,
+            providers=["CUDAExecutionProvider"]
+        )       
+        return "CUDAExecutionProvider" in sess.get_providers()
+    except Exception:
+
+        return False
 
 # Combined GPU availability
-GPU_AVAILABLE = TF_GPU_AVAILABLE or ONNX_GPU_AVAILABLE
-print(f"Overall GPU Available: {GPU_AVAILABLE}")
+#GPU_AVAILABLE = TF_GPU_AVAILABLE or ONNX_GPU_AVAILABLE
+#print(f"Overall GPU Available: {GPU_AVAILABLE}")
 
 # ==================== EASYOCR INITIALIZATION (PII DETECTION) ====================
 
@@ -377,29 +389,56 @@ PRIMARY_PERSON_MATCH_THRESHOLD = 0.50
 # ==================== INSIGHTFACE INITIALIZATION (BACKBONE) ====================
 
 print("Initializing InsightFace (BACKBONE) with GPU acceleration...")
+ONNX_GPU_AVAILABLE = real_onnx_gpu_available()
+
 if ONNX_GPU_AVAILABLE:
-    app = FaceAnalysis(providers=['CUDAExecutionProvider','TensorrtExecutionProvider'])
-    print("InsightFace: Using CUDA GPU")
+    print("ONNX Runtime: CUDA GPU USABLE (verified)")
 else:
-    app = FaceAnalysis(providers=['CPUExecutionProvider'])
+    print("ONNX Runtime: CUDA NOT usable → CPU fallback")
+
+# if ONNX_GPU_AVAILABLE:
+#     app = FaceAnalysis(providers=['CUDAExecutionProvider','TensorrtExecutionProvider'])
+#     print("InsightFace: Using CUDA GPU")
+# else:
+#     app = FaceAnalysis(providers=['CPUExecutionProvider'])
+#     print("InsightFace: Using CPU")
+if ONNX_GPU_AVAILABLE:
+    providers = ["CUDAExecutionProvider"]
+    ctx_id = 0
+    print("InsightFace: Using CUDA GPU (verified)")
+else:
+    providers = ["CPUExecutionProvider"]
+    ctx_id = -1
     print("InsightFace: Using CPU")
 
-app.prepare(ctx_id=0 if ONNX_GPU_AVAILABLE else -1, det_size=(640, 640))
+app = FaceAnalysis(providers=providers)
+app.prepare(ctx_id=ctx_id, det_size=(640, 640))
+
+#app.prepare(ctx_id=0 if ONNX_GPU_AVAILABLE else -1, det_size=(640, 640))
 
 # Initialize recognition model for face comparison
 print("Loading InsightFace recognition model...")
+# try:
+#     if ONNX_GPU_AVAILABLE:
+#         recognition_model = get_model('buffalo_l', providers=['CUDAExecutionProvider','TensorrtExecutionProvider'])
+#     else:
+#         print('issue in CUDA Executor')
+#         recognition_model = get_model('buffalo_l', providers=['CPUExecutionProvider'])
+#     print("InsightFace recognition model loaded successfully")
+# except Exception as e:
+#     print(f"Note: Recognition model loading info: {e}")
+#     recognition_model = None
 try:
-    if ONNX_GPU_AVAILABLE:
-        recognition_model = get_model('buffalo_l', providers=['CUDAExecutionProvider','TensorrtExecutionProvider'])
-    else:
-        print('issue in CUDA Executor')
-        recognition_model = get_model('buffalo_l', providers=['CPUExecutionProvider'])
+    recognition_model = get_model("buffalo_l", providers=providers)
     print("InsightFace recognition model loaded successfully")
 except Exception as e:
-    print(f"Note: Recognition model loading info: {e}")
+    print(f"Recognition model load failed: {e}")
     recognition_model = None
 
 print(f"InsightFace initialized successfully (BACKBONE) - GPU: {ONNX_GPU_AVAILABLE}")
+
+
+#print(f"InsightFace initialized successfully (BACKBONE) - GPU: {ONNX_GPU_AVAILABLE}")
 
 
 # ==================== DEEPFACE CONFIGURATION (AGE & ETHNICITY ONLY) ====================
