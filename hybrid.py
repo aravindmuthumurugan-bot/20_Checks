@@ -378,7 +378,7 @@ PRIMARY_PERSON_MATCH_THRESHOLD = 0.50
 
 print("Initializing InsightFace (BACKBONE) with GPU acceleration...")
 if ONNX_GPU_AVAILABLE:
-    app = FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    app = FaceAnalysis(providers=['CUDAExecutionProvider','TensorrtExecutionProvider'])
     print("InsightFace: Using CUDA GPU")
 else:
     app = FaceAnalysis(providers=['CPUExecutionProvider'])
@@ -390,8 +390,9 @@ app.prepare(ctx_id=0 if ONNX_GPU_AVAILABLE else -1, det_size=(640, 640))
 print("Loading InsightFace recognition model...")
 try:
     if ONNX_GPU_AVAILABLE:
-        recognition_model = get_model('buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        recognition_model = get_model('buffalo_l', providers=['CUDAExecutionProvider','TensorrtExecutionProvider'])
     else:
+        print('issue in CUDA Executor')
         recognition_model = get_model('buffalo_l', providers=['CPUExecutionProvider'])
     print("InsightFace recognition model loaded successfully")
 except Exception as e:
