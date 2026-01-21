@@ -3,6 +3,7 @@ import os
 import numpy as np
 import base64
 import tempfile
+import re
 from typing import Dict, List, Tuple, Optional
 from retinaface import RetinaFace
 from nudenet import NudeDetector
@@ -14,6 +15,9 @@ from insightface.model_zoo import get_model
 
 # DeepFace imports (AGE & ETHNICITY ONLY)
 from deepface import DeepFace
+
+# EasyOCR for text detection and PII check (GPU-ACCELERATED)
+import easyocr
 
 # TensorFlow GPU configuration (CRITICAL)
 import tensorflow as tf
@@ -87,6 +91,235 @@ except:
 # Combined GPU availability
 GPU_AVAILABLE = TF_GPU_AVAILABLE or ONNX_GPU_AVAILABLE
 print(f"Overall GPU Available: {GPU_AVAILABLE}")
+
+# ==================== EASYOCR INITIALIZATION (PII DETECTION) ====================
+
+print("Initializing EasyOCR for PII Detection with GPU acceleration...")
+try:
+    import torch
+    PYTORCH_GPU_AVAILABLE = torch.cuda.is_available()
+    if PYTORCH_GPU_AVAILABLE:
+        print(f"PyTorch CUDA Available: {torch.cuda.get_device_name(0)}")
+        ocr_reader = easyocr.Reader(['en'], gpu=True, verbose=False)
+        print("EasyOCR: Using CUDA GPU")
+    else:
+        ocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+        print("EasyOCR: Using CPU")
+except Exception as e:
+    print(f"EasyOCR initialization error: {e}")
+    ocr_reader = None
+    PYTORCH_GPU_AVAILABLE = False
+
+print(f"EasyOCR initialized successfully - GPU: {PYTORCH_GPU_AVAILABLE}")
+
+# ==================== PII DETECTION PATTERNS ====================
+
+# Phone number patterns (Indian and International)
+PHONE_PATTERNS = [
+    r'\b(?:\+91[\s-]?)?[6-9]\d{9}\b',  # Indian mobile: +91 9876543210, 9876543210
+    r'\b(?:\+91[\s-]?)?\d{5}[\s-]?\d{5}\b',  # Indian with space: 98765 43210
+    r'\b(?:\+1[\s-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b',  # US: (123) 456-7890
+    r'\b\d{3}[\s.-]\d{3}[\s.-]\d{4}\b',  # Generic: 123-456-7890
+    r'\b\d{10,12}\b',  # 10-12 digit numbers
+]
+
+# Email patterns
+EMAIL_PATTERNS = [
+    r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',  # Standard email
+    r'\b[A-Za-z0-9._%+-]+\s*[@]\s*[A-Za-z0-9.-]+\s*[.]\s*[A-Z|a-z]{2,}\b',  # Email with spaces
+    r'\b[A-Za-z0-9._%+-]+\s*\[at\]\s*[A-Za-z0-9.-]+\s*\[dot\]\s*[A-Z|a-z]{2,}\b',  # Obfuscated
+]
+
+# Instagram ID patterns
+INSTAGRAM_PATTERNS = [
+    r'@[A-Za-z0-9._]{1,30}\b',  # @username
+    r'\b(?:instagram|insta|ig)[\s:]*@?[A-Za-z0-9._]{1,30}\b',  # instagram: username
+    r'\binsta[\s]*id[\s:]*@?[A-Za-z0-9._]{1,30}\b',  # insta id: username
+]
+
+# Other social media patterns
+SOCIAL_MEDIA_PATTERNS = [
+    r'\b(?:facebook|fb)[\s:]*[A-Za-z0-9._/]{1,50}\b',  # Facebook
+    r'\b(?:twitter|x)[\s:]*@?[A-Za-z0-9._]{1,30}\b',  # Twitter/X
+    r'\b(?:snapchat|snap)[\s:]*[A-Za-z0-9._]{1,30}\b',  # Snapchat
+    r'\b(?:telegram|tg)[\s:]*@?[A-Za-z0-9._]{1,30}\b',  # Telegram
+    r'\b(?:whatsapp|wa)[\s:]*[\+]?\d{10,15}\b',  # WhatsApp
+]
+
+# Personal ID patterns (Aadhaar, PAN, etc.)
+PERSONAL_ID_PATTERNS = [
+    r'\b\d{4}[\s-]?\d{4}[\s-]?\d{4}\b',  # Aadhaar: 1234 5678 9012
+    r'\b[A-Z]{5}\d{4}[A-Z]\b',  # PAN: ABCDE1234F
+]
+
+# URL patterns
+URL_PATTERNS = [
+    r'https?://[^\s]+',  # Full URL
+    r'www\.[^\s]+',  # www URL
+    r'\b[A-Za-z0-9.-]+\.(?:com|in|org|net|co\.in|io)\b',  # Domain names
+]
+
+# Combine all PII patterns
+ALL_PII_PATTERNS = {
+    "phone_number": PHONE_PATTERNS,
+    "email": EMAIL_PATTERNS,
+    "instagram": INSTAGRAM_PATTERNS,
+    "social_media": SOCIAL_MEDIA_PATTERNS,
+    "personal_id": PERSONAL_ID_PATTERNS,
+    "url": URL_PATTERNS,
+}
+
+
+# ==================== PII DETECTION FUNCTION (GPU-ACCELERATED) ====================
+
+def detect_pii_in_image(image_path: str) -> Dict:
+    """
+    Detect Personal Identifiable Information (PII) in image using EasyOCR with GPU.
+
+    Checks for:
+    - Phone numbers (Indian and International formats)
+    - Email addresses
+    - Instagram IDs and handles
+    - Other social media handles (Facebook, Twitter, Snapchat, Telegram, WhatsApp)
+    - Personal IDs (Aadhaar, PAN)
+    - URLs and website links
+
+    Returns:
+        Dict with status (PASS/FAIL), detected PII, and reason
+    """
+    try:
+        if ocr_reader is None:
+            return {
+                "status": "REVIEW",
+                "reason": "OCR reader not initialized",
+                "text_detected": False,
+                "pii_found": [],
+                "raw_text": None
+            }
+
+        print(f"[PII Detection GPU] Running OCR on image...")
+
+        # Run EasyOCR on the image (GPU-accelerated if available)
+        results = ocr_reader.readtext(image_path)
+
+        if not results:
+            return {
+                "status": "PASS",
+                "reason": "No text detected in image",
+                "text_detected": False,
+                "pii_found": [],
+                "raw_text": None
+            }
+
+        # Extract all detected text
+        detected_texts = []
+        for (bbox, text, confidence) in results:
+            if confidence > 0.3:  # Only consider text with reasonable confidence
+                detected_texts.append(text)
+
+        if not detected_texts:
+            return {
+                "status": "PASS",
+                "reason": "No readable text detected in image",
+                "text_detected": False,
+                "pii_found": [],
+                "raw_text": None
+            }
+
+        # Combine all text for pattern matching
+        combined_text = " ".join(detected_texts)
+        print(f"[PII Detection GPU] Detected text: {combined_text[:100]}...")
+
+        # Check for PII patterns
+        pii_found = []
+
+        for pii_type, patterns in ALL_PII_PATTERNS.items():
+            for pattern in patterns:
+                matches = re.findall(pattern, combined_text, re.IGNORECASE)
+                if matches:
+                    for match in matches:
+                        # Filter out false positives
+                        if pii_type == "phone_number":
+                            # Exclude numbers that are too short or look like dates
+                            if len(re.sub(r'\D', '', str(match))) >= 10:
+                                pii_found.append({
+                                    "type": pii_type,
+                                    "value": match,
+                                    "masked": mask_pii(match, pii_type)
+                                })
+                        else:
+                            pii_found.append({
+                                "type": pii_type,
+                                "value": match,
+                                "masked": mask_pii(match, pii_type)
+                            })
+
+        # Remove duplicates
+        unique_pii = []
+        seen_values = set()
+        for pii in pii_found:
+            if pii["value"] not in seen_values:
+                unique_pii.append(pii)
+                seen_values.add(pii["value"])
+
+        if unique_pii:
+            pii_types = list(set([p["type"] for p in unique_pii]))
+            return {
+                "status": "FAIL",
+                "reason": f"PII detected in image: {', '.join(pii_types)}",
+                "text_detected": True,
+                "pii_found": unique_pii,
+                "pii_types": pii_types,
+                "raw_text": combined_text[:200] + "..." if len(combined_text) > 200 else combined_text
+            }
+
+        return {
+            "status": "PASS",
+            "reason": "Text detected but no PII found",
+            "text_detected": True,
+            "pii_found": [],
+            "raw_text": combined_text[:200] + "..." if len(combined_text) > 200 else combined_text
+        }
+
+    except Exception as e:
+        print(f"[PII Detection GPU] Error: {str(e)}")
+        return {
+            "status": "REVIEW",
+            "reason": f"PII detection error: {str(e)}",
+            "text_detected": False,
+            "pii_found": [],
+            "raw_text": None
+        }
+
+
+def mask_pii(value: str, pii_type: str) -> str:
+    """Mask PII value for logging/display purposes"""
+    if pii_type == "phone_number":
+        # Show only last 4 digits
+        digits = re.sub(r'\D', '', value)
+        if len(digits) >= 4:
+            return "X" * (len(digits) - 4) + digits[-4:]
+        return "X" * len(value)
+    elif pii_type == "email":
+        # Show first 2 chars and domain
+        if "@" in value:
+            parts = value.split("@")
+            if len(parts[0]) > 2:
+                return parts[0][:2] + "***@" + parts[1]
+            return "***@" + parts[1]
+        return "***"
+    elif pii_type in ["instagram", "social_media"]:
+        # Show @ and first 2 chars
+        if value.startswith("@"):
+            return "@" + value[1:3] + "***" if len(value) > 3 else value
+        return value[:2] + "***" if len(value) > 2 else value
+    elif pii_type == "personal_id":
+        # Show only last 4 chars
+        return "X" * (len(value) - 4) + value[-4:] if len(value) > 4 else "X" * len(value)
+    elif pii_type == "url":
+        # Show domain only
+        return "[URL HIDDEN]"
+    return "***"
 
 
 # ==================== STAGE 1 CONFIGURATION ====================
@@ -676,7 +909,19 @@ def stage1_validate(
             checks["face_coverage_check"] = "SKIPPED - Not applicable for group photos"
             checks["cropping_applied"] = "NO - Group photos are not cropped"
 
-            # For group photos, we're done after matching check
+            # PII DETECTION for group photos (GPU-ACCELERATED)
+            print(f"[Stage 1] Running PII detection on group photo with EasyOCR (GPU)...")
+            pii_result = detect_pii_in_image(image_path)
+            checks["pii_detection"] = pii_result
+
+            if pii_result["status"] == "FAIL":
+                pii_types = pii_result.get("pii_types", [])
+                rejection_reason = f"Personal information detected in image: {', '.join(pii_types)}"
+                return reject(rejection_reason, checks)
+
+            checks["pii_check"] = "PASS" if pii_result["status"] == "PASS" else "REVIEW"
+
+            # For group photos, we're done after matching and PII check
             return pass_stage(checks, cropped_image)
 
         else:
@@ -764,6 +1009,18 @@ def stage1_validate(
             else:
                 checks["cropping_applied"] = "NO"
                 checks["face_coverage_check"] = f"PASS - Face coverage sufficient ({coverage * 100:.2f}%)"
+
+            # PII DETECTION for individual secondary photos (GPU-ACCELERATED)
+            print(f"[Stage 1] Running PII detection on secondary photo with EasyOCR (GPU)...")
+            pii_result = detect_pii_in_image(image_path)
+            checks["pii_detection"] = pii_result
+
+            if pii_result["status"] == "FAIL":
+                pii_types = pii_result.get("pii_types", [])
+                rejection_reason = f"Personal information detected in image: {', '.join(pii_types)}"
+                return reject(rejection_reason, checks)
+
+            checks["pii_check"] = "PASS" if pii_result["status"] == "PASS" else "REVIEW"
 
             # For individual secondary photos, we're done
             return pass_stage(checks, cropped_image)
@@ -907,13 +1164,28 @@ def stage1_validate(
         if was_cropped:
             os.remove(cropped_temp_path)
         return reject(nsfw_reason, checks, cropped_image)
-    
+
     checks["nsfw"] = "PASS"
-    
+
+    # PII DETECTION (TEXT/OCR CHECK) - GPU ACCELERATED
+    print(f"[Stage 1] Running PII detection with EasyOCR (GPU)...")
+    pii_result = detect_pii_in_image(validation_image_path)
+    checks["pii_detection"] = pii_result
+
+    if pii_result["status"] == "FAIL":
+        if was_cropped:
+            os.remove(cropped_temp_path)
+        # Include detected PII types in rejection reason
+        pii_types = pii_result.get("pii_types", [])
+        rejection_reason = f"Personal information detected in image: {', '.join(pii_types)}"
+        return reject(rejection_reason, checks, cropped_image)
+
+    checks["pii_check"] = "PASS" if pii_result["status"] == "PASS" else "REVIEW"
+
     # CLEANUP & FINAL
     if was_cropped:
         os.remove(cropped_temp_path)
-    
+
     return pass_stage(checks, cropped_image)
 
 
@@ -1781,7 +2053,8 @@ def compile_checklist_summary(stage1_result: Dict, stage2_result: Optional[Dict]
         {"id": 7, "name": "Blur Detection", "stage": "S1", "check_key": "blur"},
         {"id": 8, "name": "Orientation", "stage": "S1", "check_key": "orientation"},
         {"id": 9, "name": "Face Cover/Mask", "stage": "S1", "check_key": "face_cover"},
-        {"id": 10, "name": "NSFW Content", "stage": "S1", "check_key": "nsfw"}
+        {"id": 10, "name": "NSFW Content", "stage": "S1", "check_key": "nsfw"},
+        {"id": 11, "name": "PII Detection (EasyOCR GPU)", "stage": "S1", "check_key": "pii_check"}
     ]
     
     for check_config in stage1_checks_config:
@@ -1852,13 +2125,13 @@ def compile_checklist_summary(stage1_result: Dict, stage2_result: Optional[Dict]
     # Stage 2 checks
     if stage2_result:
         stage2_checks_config = [
-            {"id": 11, "name": "Age Verification (DeepFace)", "check_key": "age"},
-            {"id": 12, "name": "Gender Validation", "check_key": "gender"},
-            {"id": 13, "name": "Ethnicity Validation (DeepFace)", "check_key": "ethnicity"},
-            {"id": 14, "name": "Face Coverage (InsightFace)", "check_key": "face_coverage"},
-            {"id": 15, "name": "Digital Enhancement", "check_key": "enhancement"},
-            {"id": 16, "name": "Photo-of-Photo", "check_key": "photo_of_photo"},
-            {"id": 17, "name": "AI-Generated", "check_key": "ai_generated"}
+            {"id": 12, "name": "Age Verification (DeepFace)", "check_key": "age"},
+            {"id": 13, "name": "Gender Validation", "check_key": "gender"},
+            {"id": 14, "name": "Ethnicity Validation (DeepFace)", "check_key": "ethnicity"},
+            {"id": 15, "name": "Face Coverage (InsightFace)", "check_key": "face_coverage"},
+            {"id": 16, "name": "Digital Enhancement", "check_key": "enhancement"},
+            {"id": 17, "name": "Photo-of-Photo", "check_key": "photo_of_photo"},
+            {"id": 18, "name": "AI-Generated", "check_key": "ai_generated"}
         ]
         
         performed = stage2_result.get("checks_performed", [])
