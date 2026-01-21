@@ -3,53 +3,17 @@ import os
 import numpy as np
 import base64
 import tempfile
-import re
 from typing import Dict, List, Tuple, Optional
 from retinaface import RetinaFace
 from nudenet import NudeDetector
 
-# InsightFace imports (BACKBONE) - moved inside functions for lazy loading
+# InsightFace imports (BACKBONE)
+import insightface
+from insightface.app import FaceAnalysis
+from insightface.model_zoo import get_model
 
-# Environment variables to speed up startup
-os.environ['DISABLE_MODEL_SOURCE_CHECK'] = 'True'  # Disable DeepFace connectivity check
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduce TensorFlow logging (0=all, 1=info, 2=warning, 3=error)
-os.environ['ORT_LOG_LEVEL'] = '3'  # Reduce ONNX Runtime logging (0=verbose, 1=info, 2=warning, 3=error, 4=fatal)
-
-# DeepFace imports (AGE & ETHNICITY ONLY) - moved inside functions for lazy loading
-
-# OCR for GPU-accelerated text detection (PII Check)
-# Try PaddleOCR first (better GPU support, no lzma dependency), fallback to EasyOCR
-OCR_ENGINE = None
-OCR_AVAILABLE = False
-paddleocr_instance = None
-easyocr_reader = None
-
-# Try PaddleOCR first (will use CPU to avoid GPU conflicts)
-try:
-    from paddleocr import PaddleOCR
-    OCR_ENGINE = "paddleocr"
-    OCR_AVAILABLE = True
-    print("PaddleOCR loaded successfully (CPU mode to avoid GPU conflicts)")
-except ImportError:
-    pass
-except Exception as e:
-    print(f"PaddleOCR import warning: {e}")
-
-# Fallback to EasyOCR if PaddleOCR not available
-if not OCR_AVAILABLE:
-    try:
-        import easyocr
-        OCR_ENGINE = "easyocr"
-        OCR_AVAILABLE = True
-        print("EasyOCR loaded successfully")
-    except ImportError as e:
-        print(f"EasyOCR not available: {e}")
-    except Exception as e:
-        print(f"EasyOCR import error: {e}")
-
-if not OCR_AVAILABLE:
-    print("WARNING: No OCR engine available. PII detection will be limited.")
-    print("Install with: pip install paddlepaddle-gpu paddleocr")
+# DeepFace imports (AGE & ETHNICITY ONLY)
+from deepface import DeepFace
 
 # TensorFlow GPU configuration (CRITICAL)
 import tensorflow as tf
@@ -124,102 +88,6 @@ except:
 GPU_AVAILABLE = TF_GPU_AVAILABLE or ONNX_GPU_AVAILABLE
 print(f"Overall GPU Available: {GPU_AVAILABLE}")
 
-# ==================== OCR INITIALIZATION (THREAD-SAFE LAZY INIT) ====================
-
-import threading
-
-# OCR will be initialized lazily on first use (CPU mode to avoid GPU conflicts)
-OCR_GPU_AVAILABLE = False  # Force CPU mode for PaddleOCR
-OCR_INITIALIZED = False
-_ocr_init_lock = threading.Lock()  # Thread-safe initialization lock
-
-def get_ocr_instance():
-    """
-    Thread-safe lazy initialization of OCR to avoid GPU conflicts at startup.
-    Uses double-checked locking pattern for efficiency in production.
-    """
-    global paddleocr_instance, easyocr_reader, OCR_AVAILABLE, OCR_GPU_AVAILABLE, OCR_INITIALIZED
-
-    # Fast path - already initialized (no lock needed)
-    if OCR_INITIALIZED:
-        if OCR_ENGINE == "paddleocr":
-            return paddleocr_instance
-        elif OCR_ENGINE == "easyocr":
-            return easyocr_reader
-        return None
-
-    if not OCR_AVAILABLE:
-        return None
-
-    # Slow path - need to initialize (with lock for thread safety)
-    with _ocr_init_lock:
-        # Double-check after acquiring lock (another thread may have initialized)
-        if OCR_INITIALIZED:
-            if OCR_ENGINE == "paddleocr":
-                return paddleocr_instance
-            elif OCR_ENGINE == "easyocr":
-                return easyocr_reader
-            return None
-
-        if OCR_ENGINE == "paddleocr":
-            try:
-                print(f"[OCR Init] Initializing PaddleOCR (thread-safe, CPU mode to avoid GPU conflicts)...")
-                # Use CPU mode to avoid GPU memory conflicts with TensorFlow/ONNX
-                paddleocr_instance = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
-                OCR_GPU_AVAILABLE = False  # Force CPU mode
-                OCR_INITIALIZED = True
-                print(f"[OCR Init] PaddleOCR initialized successfully (CPU mode)")
-                return paddleocr_instance
-            except Exception as e:
-                print(f"[OCR Init] PaddleOCR initialization error: {e}")
-                paddleocr_instance = None
-                OCR_AVAILABLE = False
-                OCR_GPU_AVAILABLE = False
-                return None
-        elif OCR_ENGINE == "easyocr":
-            try:
-                print(f"[OCR Init] Initializing EasyOCR (thread-safe, GPU: {GPU_AVAILABLE})...")
-                easyocr_reader = easyocr.Reader(['en'], gpu=GPU_AVAILABLE, verbose=False)
-                OCR_GPU_AVAILABLE = GPU_AVAILABLE
-                OCR_INITIALIZED = True
-                print(f"[OCR Init] EasyOCR initialized successfully")
-                return easyocr_reader
-            except Exception as e:
-                print(f"[OCR Init] EasyOCR initialization error: {e}")
-                easyocr_reader = None
-                OCR_AVAILABLE = False
-                OCR_GPU_AVAILABLE = False
-                return None
-
-    return None
-
-
-def warmup_ocr():
-    """
-    Pre-initialize OCR engine during server startup (after other GPU libs).
-    Call this from API startup event to avoid first-request delay.
-    """
-    if not OCR_AVAILABLE:
-        print("[OCR Warmup] No OCR engine available, skipping warmup")
-        return False
-
-    print(f"[OCR Warmup] Pre-initializing {OCR_ENGINE} for production (CPU mode)...")
-    instance = get_ocr_instance()
-    if instance is not None:
-        print(f"[OCR Warmup] {OCR_ENGINE} ready for production (CPU mode, no first-request delay)")
-        return True
-    else:
-        print(f"[OCR Warmup] Failed to initialize {OCR_ENGINE}")
-        return False
-
-
-if OCR_AVAILABLE:
-    print(f"OCR Engine: {OCR_ENGINE} (thread-safe lazy init on first use, CPU mode)")
-else:
-    print("No OCR engine available. Install with: pip install paddlepaddle-gpu paddleocr")
-
-print("InsightFace: Lazy initialization on first use")
-
 
 # ==================== STAGE 1 CONFIGURATION ====================
 
@@ -275,43 +143,29 @@ PRIMARY_PERSON_MATCH_THRESHOLD = 0.50
 
 # ==================== INSIGHTFACE INITIALIZATION (BACKBONE) ====================
 
-# Lazy initialization for InsightFace to speed up startup
-app = None
-recognition_model = None
-insightface_initialized = False
-_insightface_lock = threading.Lock()
+print("Initializing InsightFace (BACKBONE) with GPU acceleration...")
+if ONNX_GPU_AVAILABLE:
+    app = FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    print("InsightFace: Using CUDA GPU")
+else:
+    app = FaceAnalysis(providers=['CPUExecutionProvider'])
+    print("InsightFace: Using CPU")
 
-def get_insightface_app():
-    """
-    Thread-safe lazy initialization of InsightFace app.
-    """
-    global app, insightface_initialized
+app.prepare(ctx_id=0 if ONNX_GPU_AVAILABLE else -1, det_size=(640, 640))
 
-    if insightface_initialized:
-        return app
+# Initialize recognition model for face comparison
+print("Loading InsightFace recognition model...")
+try:
+    if ONNX_GPU_AVAILABLE:
+        recognition_model = get_model('buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    else:
+        recognition_model = get_model('buffalo_l', providers=['CPUExecutionProvider'])
+    print("InsightFace recognition model loaded successfully")
+except Exception as e:
+    print(f"Note: Recognition model loading info: {e}")
+    recognition_model = None
 
-    with _insightface_lock:
-        if insightface_initialized:
-            return app
-
-        # Lazy import to delay model loading until first use
-        import insightface
-        from insightface.app import FaceAnalysis
-
-        print("Initializing InsightFace (BACKBONE) with GPU acceleration...")
-        if ONNX_GPU_AVAILABLE:
-            app = FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-            print("InsightFace: Using CUDA GPU")
-        else:
-            app = FaceAnalysis(providers=['CPUExecutionProvider'])
-            print("InsightFace: Using CPU")
-
-        app.prepare(ctx_id=0 if ONNX_GPU_AVAILABLE else -1, det_size=(640, 640))
-        insightface_initialized = True
-        print(f"InsightFace initialized successfully (BACKBONE) - GPU: {ONNX_GPU_AVAILABLE}")
-        return app
-
-# Note: recognition_model removed as it's not used in the code
+print(f"InsightFace initialized successfully (BACKBONE) - GPU: {ONNX_GPU_AVAILABLE}")
 
 
 # ==================== DEEPFACE CONFIGURATION (AGE & ETHNICITY ONLY) ====================
@@ -676,7 +530,7 @@ def find_primary_person_in_group(
         group_img = cv2.imread(group_photo_path)
         ref_img = cv2.imread(reference_photo_path)
         
-        group_faces = get_insightface_app().get(group_img)
+        group_faces = app.get(group_img)
         
         if not group_faces or len(group_faces) == 0:
             return False, None, None, "No faces detected in group photo"
@@ -684,7 +538,7 @@ def find_primary_person_in_group(
         if len(group_faces) == 1:
             return False, None, None, "Only one face detected - not a group photo"
         
-        ref_faces = get_insightface_app().get(ref_img)
+        ref_faces = app.get(ref_img)
         if not ref_faces or len(ref_faces) == 0:
             return False, None, None, "No face detected in reference photo"
         
@@ -851,12 +705,12 @@ def stage1_validate(
             # Use InsightFace to verify the person matches
             try:
                 ref_img = cv2.imread(reference_photo_path)
-                ref_faces = get_insightface_app().get(ref_img)
+                ref_faces = app.get(ref_img)
                 if not ref_faces or len(ref_faces) == 0:
                     return reject("No face detected in reference photo", checks)
 
                 curr_img = cv2.imread(image_path)
-                curr_faces = get_insightface_app().get(curr_img)
+                curr_faces = app.get(curr_img)
                 if not curr_faces or len(curr_faces) == 0:
                     return reject("No face detected in secondary photo", checks)
 
@@ -1072,7 +926,7 @@ def analyze_face_insightface(img_path: str) -> Dict:
         if img is None:
             return {"error": "Could not read image", "data": None}
         
-        faces = get_insightface_app().get(img)
+        faces = app.get(img)
         
         if not faces or len(faces) == 0:
             return {"error": "No face detected", "data": None}
@@ -1101,9 +955,6 @@ def validate_age_deepface(img_path: str, profile_age: int) -> Dict:
     Age verification using DeepFace with GPU acceleration (PRIMARY photos only)
     DeepFace has better age accuracy than InsightFace
     """
-    # Lazy import to delay model loading
-    from deepface import DeepFace
-
     try:
         print(f"[DeepFace GPU] Running age detection for profile age: {profile_age}...")
         
@@ -1201,9 +1052,6 @@ def validate_ethnicity_deepface(img_path: str) -> Dict:
     3. Disallowed ethnicities should not exceed their thresholds
        - DISALLOWED_ETHNICITIES are in decimal format (0.60 = 60%)
     """
-    # Lazy import to delay model loading
-    from deepface import DeepFace
-
     try:
         print("[DeepFace GPU] Running ethnicity detection...")
         
@@ -1293,9 +1141,6 @@ def validate_gender_deepface(img_path: str, profile_gender: str) -> Dict:
     """
     Gender validation using DeepFace with GPU acceleration (optional fallback if InsightFace gender is unreliable)
     """
-    # Lazy import to delay model loading
-    from deepface import DeepFace
-
     try:
         print("[DeepFace GPU] Running gender detection...")
         
@@ -1705,282 +1550,6 @@ def detect_ai_generated(img_path: str) -> Dict:
         }
 
 
-# ==================== PII DETECTION (GPU-ACCELERATED OCR) ====================
-
-# PII Pattern Definitions
-PII_PATTERNS = {
-    # Indian mobile numbers: 10 digits starting with 6-9, with optional +91 or 0 prefix
-    "mobile_number": [
-        r'\+91[\s\-]?[6-9]\d{9}',           # +91 9876543210 or +91-9876543210
-        r'\b0?[6-9]\d{9}\b',                 # 9876543210 or 09876543210
-        r'\b[6-9]\d{4}[\s\-]?\d{5}\b',       # 98765 43210 or 98765-43210
-        r'\b[6-9]\d{2}[\s\-]?\d{3}[\s\-]?\d{4}\b',  # 987-654-3210
-    ],
-    # Email addresses
-    "email": [
-        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
-        r'\b[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\s*\.\s*[A-Z|a-z]{2,}\b',  # With spaces
-    ],
-    # Instagram IDs
-    "instagram": [
-        r'@[A-Za-z0-9_.]{1,30}\b',           # @username
-        r'\binsta\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,30}\b',  # insta: username or insta @username
-        r'\binstagram\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,30}\b',  # instagram: username
-        r'\big\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,30}\b',  # ig: username
-    ],
-    # WhatsApp numbers (similar to mobile but with WA prefix)
-    "whatsapp": [
-        r'\bwa\s*[:\-]?\s*\+?91?[\s\-]?[6-9]\d{9}\b',  # wa: +919876543210
-        r'\bwhatsapp\s*[:\-]?\s*\+?91?[\s\-]?[6-9]\d{9}\b',
-    ],
-    # Facebook IDs
-    "facebook": [
-        r'\bfb\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,50}\b',  # fb: username
-        r'\bfacebook\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,50}\b',
-    ],
-    # Snapchat IDs
-    "snapchat": [
-        r'\bsnap\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,30}\b',
-        r'\bsnapchat\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,30}\b',
-        r'\bsc\s*[:\-]?\s*@?[A-Za-z0-9_.]{1,30}\b',
-    ],
-    # Telegram IDs
-    "telegram": [
-        r'\btelegram\s*[:\-]?\s*@?[A-Za-z0-9_]{5,32}\b',
-        r'\btg\s*[:\-]?\s*@?[A-Za-z0-9_]{5,32}\b',
-    ],
-    # Generic contact sharing patterns
-    "contact_info": [
-        r'\bcall\s*me\s*[:\-]?\s*\d+',
-        r'\bcontact\s*[:\-]?\s*\d+',
-        r'\btext\s*me\s*[:\-]?\s*\d+',
-        r'\bmsg\s*me\s*[:\-]?\s*\d+',
-        r'\bping\s*me\s*[:\-]?\s*\d+',
-        r'\bdm\s*me\b',
-    ],
-}
-
-# Words/patterns to exclude from false positives
-PII_EXCLUDE_PATTERNS = [
-    r'^@\d+$',  # Just @number (often photo metadata)
-    r'^@[a-z]$',  # Single letter usernames
-    r'@gmail\.com$',  # Full email shouldn't trigger instagram
-    r'@yahoo\.com$',
-    r'@hotmail\.com$',
-]
-
-
-def detect_pii_in_image(img_path: str) -> Dict:
-    """
-    Detect Personal Identifiable Information (PII) in images using GPU-accelerated OCR.
-
-    Detects:
-    - Mobile numbers (Indian format)
-    - Email addresses
-    - Instagram IDs
-    - WhatsApp numbers
-    - Facebook IDs
-    - Snapchat IDs
-    - Telegram IDs
-    - Generic contact sharing patterns
-
-    Returns:
-        Dict with status (PASS/FAIL/REVIEW), detected PII types, and details
-    """
-    try:
-        if not OCR_AVAILABLE:
-            return {
-                "status": "REVIEW",
-                "reason": "OCR not available for PII detection",
-                "pii_detected": False,
-                "pii_types": [],
-                "detected_text": None,
-                "ocr_available": False,
-                "ocr_engine": None,
-                "gpu_used": False
-            }
-
-        # Read image
-        img = cv2.imread(img_path)
-        if img is None:
-            return {
-                "status": "REVIEW",
-                "reason": "Could not read image for PII detection",
-                "pii_detected": False,
-                "pii_types": [],
-                "detected_text": None,
-                "ocr_available": True,
-                "ocr_engine": OCR_ENGINE,
-                "gpu_used": OCR_GPU_AVAILABLE
-            }
-
-        # Get OCR instance (lazy initialization)
-        ocr_instance = get_ocr_instance()
-        if ocr_instance is None:
-            return {
-                "status": "REVIEW",
-                "reason": "OCR initialization failed",
-                "pii_detected": False,
-                "pii_types": [],
-                "detected_text": None,
-                "ocr_available": False,
-                "ocr_engine": OCR_ENGINE,
-                "gpu_used": False
-            }
-
-        print(f"[PII Detection] Running {OCR_ENGINE} on image (GPU: {OCR_GPU_AVAILABLE})...")
-
-        # Run OCR on the image based on engine
-        detected_texts = []
-
-        if OCR_ENGINE == "paddleocr":
-            # PaddleOCR returns list of [boxes, (text, confidence)]
-            ocr_results = ocr_instance.ocr(img_path, cls=True)
-            if ocr_results and ocr_results[0]:
-                for line in ocr_results[0]:
-                    if line and len(line) >= 2:
-                        bbox = line[0]
-                        text = line[1][0]
-                        confidence = line[1][1]
-                        if confidence > 0.3:
-                            detected_texts.append({
-                                "text": text,
-                                "confidence": confidence,
-                                "bbox": bbox
-                            })
-        elif OCR_ENGINE == "easyocr":
-            # EasyOCR returns list of (bbox, text, confidence)
-            ocr_results = ocr_instance.readtext(img)
-            if ocr_results:
-                for (bbox, text, confidence) in ocr_results:
-                    if confidence > 0.3:
-                        detected_texts.append({
-                            "text": text,
-                            "confidence": confidence,
-                            "bbox": bbox
-                        })
-
-        if not detected_texts:
-            return {
-                "status": "PASS",
-                "reason": "No text detected in image",
-                "pii_detected": False,
-                "pii_types": [],
-                "detected_text": [],
-                "ocr_available": True,
-                "ocr_engine": OCR_ENGINE,
-                "gpu_used": OCR_GPU_AVAILABLE
-            }
-
-        # Combine all detected text for pattern matching
-        full_text = " ".join([t["text"] for t in detected_texts])
-
-        print(f"[PII Detection GPU] Detected text: {full_text[:100]}...")
-
-        # Check for PII patterns
-        pii_found = []
-        pii_details = {}
-
-        for pii_type, patterns in PII_PATTERNS.items():
-            for pattern in patterns:
-                matches = re.findall(pattern, full_text, re.IGNORECASE)
-                if matches:
-                    # Filter out excluded patterns
-                    valid_matches = []
-                    for match in matches:
-                        is_excluded = False
-                        for exclude_pattern in PII_EXCLUDE_PATTERNS:
-                            if re.match(exclude_pattern, match, re.IGNORECASE):
-                                is_excluded = True
-                                break
-                        if not is_excluded:
-                            valid_matches.append(match)
-
-                    if valid_matches:
-                        if pii_type not in pii_found:
-                            pii_found.append(pii_type)
-                        if pii_type not in pii_details:
-                            pii_details[pii_type] = []
-                        pii_details[pii_type].extend(valid_matches)
-
-        # Remove duplicates from details
-        for pii_type in pii_details:
-            pii_details[pii_type] = list(set(pii_details[pii_type]))
-
-        if pii_found:
-            # Determine severity
-            critical_pii = ["mobile_number", "email", "whatsapp"]
-            social_pii = ["instagram", "facebook", "snapchat", "telegram"]
-
-            has_critical = any(pii in critical_pii for pii in pii_found)
-            has_social = any(pii in social_pii for pii in pii_found)
-
-            if has_critical:
-                return {
-                    "status": "FAIL",
-                    "reason": f"Personal contact information detected: {', '.join(pii_found)}",
-                    "pii_detected": True,
-                    "pii_types": pii_found,
-                    "pii_details": pii_details,
-                    "detected_text": detected_texts,
-                    "severity": "CRITICAL",
-                    "ocr_available": True,
-                    "ocr_engine": OCR_ENGINE,
-                    "gpu_used": OCR_GPU_AVAILABLE
-                }
-            elif has_social:
-                return {
-                    "status": "FAIL",
-                    "reason": f"Social media ID detected: {', '.join(pii_found)}",
-                    "pii_detected": True,
-                    "pii_types": pii_found,
-                    "pii_details": pii_details,
-                    "detected_text": detected_texts,
-                    "severity": "HIGH",
-                    "ocr_available": True,
-                    "ocr_engine": OCR_ENGINE,
-                    "gpu_used": OCR_GPU_AVAILABLE
-                }
-            else:
-                return {
-                    "status": "REVIEW",
-                    "reason": f"Potential contact sharing detected: {', '.join(pii_found)}",
-                    "pii_detected": True,
-                    "pii_types": pii_found,
-                    "pii_details": pii_details,
-                    "detected_text": detected_texts,
-                    "severity": "MEDIUM",
-                    "ocr_available": True,
-                    "ocr_engine": OCR_ENGINE,
-                    "gpu_used": OCR_GPU_AVAILABLE
-                }
-
-        return {
-            "status": "PASS",
-            "reason": "No PII detected in image text",
-            "pii_detected": False,
-            "pii_types": [],
-            "detected_text": detected_texts,
-            "ocr_available": True,
-            "ocr_engine": OCR_ENGINE,
-            "gpu_used": OCR_GPU_AVAILABLE
-        }
-
-    except Exception as e:
-        print(f"[PII Detection GPU] Error: {str(e)}")
-        return {
-            "status": "REVIEW",
-            "reason": f"PII detection error: {str(e)}",
-            "pii_detected": False,
-            "pii_types": [],
-            "detected_text": None,
-            "error": str(e),
-            "ocr_available": OCR_AVAILABLE,
-            "ocr_engine": OCR_ENGINE,
-            "gpu_used": OCR_GPU_AVAILABLE
-        }
-
-
 # ==================== STAGE 2 MAIN VALIDATOR (HYBRID) ====================
 
 def stage2_validate_hybrid(
@@ -2034,7 +1603,7 @@ def stage2_validate_hybrid(
         results["reason"] = "SECONDARY photo validation completed in Stage 1"
         results["early_exit"] = True
         results["checks_skipped"] = ["age", "gender", "ethnicity", "face_coverage",
-                                     "enhancement", "photo_of_photo", "ai_generated", "pii_detection"]
+                                     "enhancement", "photo_of_photo", "ai_generated"]
         return results
 
     # ============= INSIGHTFACE ANALYSIS (BACKBONE) =============
@@ -2067,7 +1636,7 @@ def stage2_validate_hybrid(
             results["reason"] = "Underage detected - immediate suspension"
             results["early_exit"] = True
             results["checks_skipped"] = ["gender", "ethnicity", "face_coverage", "enhancement",
-                                         "photo_of_photo", "ai_generated", "pii_detection"]
+                                         "photo_of_photo", "ai_generated"]
             return results
     else:
         results["checks_skipped"].append("age")
@@ -2093,7 +1662,7 @@ def stage2_validate_hybrid(
             results["reason"] = "Gender mismatch detected"
             results["early_exit"] = True
             results["checks_skipped"].extend(["ethnicity", "face_coverage", "enhancement",
-                                         "photo_of_photo", "ai_generated", "pii_detection"])
+                                         "photo_of_photo", "ai_generated"])
             return results
 
         # 4. ETHNICITY CHECK (DEEPFACE - PRIMARY ONLY, GPU-ACCELERATED)
@@ -2108,7 +1677,7 @@ def stage2_validate_hybrid(
             results["reason"] = "Ethnicity check failed"
             results["early_exit"] = True
             results["checks_skipped"].extend(["face_coverage", "enhancement",
-                                         "photo_of_photo", "ai_generated", "pii_detection"])
+                                         "photo_of_photo", "ai_generated"])
             return results
     else:
         results["checks_skipped"].extend(["gender", "ethnicity"])
@@ -2137,15 +1706,7 @@ def stage2_validate_hybrid(
     # 8. AI-generated (OPENCV)
     results["checks"]["ai_generated"] = detect_ai_generated(image_path)
     results["checks_performed"].append("ai_generated")
-
-    # 9. PII Detection (OCR - GPU-ACCELERATED)
-    print(f"[P3 GPU] Checking for PII (text detection with {OCR_ENGINE or 'no'} OCR)...")
-    results["checks"]["pii_detection"] = detect_pii_in_image(image_path)
-    results["checks_performed"].append("pii_detection")
-    if OCR_AVAILABLE and OCR_ENGINE:
-        gpu_label = "GPU" if OCR_GPU_AVAILABLE else "CPU"
-        results["library_usage"][OCR_ENGINE] = [f"text_detection ({gpu_label})", f"pii_detection ({gpu_label})"]
-
+    
     # ============= FINAL DECISION LOGIC =============
     
     fail_checks = []
@@ -2188,15 +1749,6 @@ def determine_rejection_action(fail_checks: List[str], all_checks: Dict) -> str:
 
     if any(check in fail_checks for check in ["gender", "ethnicity"]):
         return "SELFIE_VERIFICATION"
-
-    # PII Detection - reject photo with personal info
-    if "pii_detection" in fail_checks:
-        pii_check = all_checks.get("pii_detection", {})
-        severity = pii_check.get("severity", "HIGH")
-        if severity == "CRITICAL":
-            return "REJECT_PII_CONTACT_INFO"
-        else:
-            return "REJECT_PII_SOCIAL_MEDIA"
 
     if "enhancement" in fail_checks or any("enhancement" in check for check in fail_checks):
         return "NUDGE_UPLOAD_ORIGINAL"
@@ -2306,8 +1858,7 @@ def compile_checklist_summary(stage1_result: Dict, stage2_result: Optional[Dict]
             {"id": 14, "name": "Face Coverage (InsightFace)", "check_key": "face_coverage"},
             {"id": 15, "name": "Digital Enhancement", "check_key": "enhancement"},
             {"id": 16, "name": "Photo-of-Photo", "check_key": "photo_of_photo"},
-            {"id": 17, "name": "AI-Generated", "check_key": "ai_generated"},
-            {"id": 18, "name": "PII Detection (EasyOCR GPU)", "check_key": "pii_detection"}
+            {"id": 17, "name": "AI-Generated", "check_key": "ai_generated"}
         ]
         
         performed = stage2_result.get("checks_performed", [])
@@ -2323,8 +1874,7 @@ def compile_checklist_summary(stage1_result: Dict, stage2_result: Optional[Dict]
                     "age": "SECONDARY photos skip age check (family members have different ages)",
                     "gender": "SECONDARY photos skip gender check (family has both genders)",
                     "ethnicity": "SECONDARY photos skip ethnicity check (family members may differ)",
-                    "face_coverage": "SECONDARY photos skip face coverage (group photos have smaller faces)",
-                    "pii_detection": "SECONDARY photos skip PII detection (checked in Stage 1 context)"
+                    "face_coverage": "SECONDARY photos skip face coverage (group photos have smaller faces)"
                 }
                 
                 checklist["checks"].append({
@@ -2535,45 +2085,42 @@ def validate_photo_complete_hybrid(
 
 # ==================== USAGE EXAMPLE ====================
 
-# Commented out to prevent accidental execution during import
-# Uncomment only for testing standalone
-#
-# if __name__ == "__main__":
-#
-#     print("\n" + "="*70)
-#     print("EXAMPLE: HYBRID PHOTO VALIDATION")
-#     print("="*70)
-#
-#     profile_data = {
-#         "matri_id": "BM123456",
-#         "gender": "Male",
-#         "age": 28
-#     }
-#
-#     result = validate_photo_complete_hybrid(
-#         image_path="test_image.jpg",
-#         photo_type="PRIMARY",
-#         profile_data=profile_data,
-#         run_stage2=True,
-#         use_deepface_gender=False  # Use InsightFace for gender (faster)
-#     )
-#
-#     print(f"\nFinal Decision: {result['final_decision']}")
-#     print(f"Final Action: {result['final_action']}")
-#     print(f"Reason: {result['final_reason']}")
-#
-#     if result.get('checklist_summary'):
-#         checklist = result['checklist_summary']
-#         print(f"\n{'='*70}")
-#         print("CHECKLIST SUMMARY")
-#         print(f"{'='*70}")
-#         print(f"Total: {checklist['total_checks']}, Passed: {checklist['passed']}, Failed: {checklist['failed']}")
-#         print(f"Skipped: {checklist['skipped']}, Review: {checklist['review']}")
-#
-#     if result.get('stage2'):
-#         print(f"\n{'='*70}")
-#         print("LIBRARY USAGE")
-#         print(f"{'='*70}")
-#         print(f"InsightFace: {', '.join(result['stage2']['library_usage']['insightface'])}")
-#         if result['stage2']['library_usage']['deepface']:
-#             print(f"DeepFace: {', '.join(result['stage2']['library_usage']['deepface'])}")
+if __name__ == "__main__":
+    
+    print("\n" + "="*70)
+    print("EXAMPLE: HYBRID PHOTO VALIDATION")
+    print("="*70)
+    
+    profile_data = {
+        "matri_id": "BM123456",
+        "gender": "Male",
+        "age": 28
+    }
+    
+    result = validate_photo_complete_hybrid(
+        image_path="test_image.jpg",
+        photo_type="PRIMARY",
+        profile_data=profile_data,
+        run_stage2=True,
+        use_deepface_gender=False  # Use InsightFace for gender (faster)
+    )
+    
+    print(f"\nFinal Decision: {result['final_decision']}")
+    print(f"Final Action: {result['final_action']}")
+    print(f"Reason: {result['final_reason']}")
+    
+    if result.get('checklist_summary'):
+        checklist = result['checklist_summary']
+        print(f"\n{'='*70}")
+        print("CHECKLIST SUMMARY")
+        print(f"{'='*70}")
+        print(f"Total: {checklist['total_checks']}, Passed: {checklist['passed']}, Failed: {checklist['failed']}")
+        print(f"Skipped: {checklist['skipped']}, Review: {checklist['review']}")
+    
+    if result.get('stage2'):
+        print(f"\n{'='*70}")
+        print("LIBRARY USAGE")
+        print(f"{'='*70}")
+        print(f"InsightFace: {', '.join(result['stage2']['library_usage']['insightface'])}")
+        if result['stage2']['library_usage']['deepface']:
+            print(f"DeepFace: {', '.join(result['stage2']['library_usage']['deepface'])}")
